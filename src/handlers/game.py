@@ -400,8 +400,12 @@ def _is_looking_around(action: str) -> bool:
 def _is_aggressive_action(action: str) -> bool:
     return bool(re.search(
         r"(атак\w*|напада\w*|удар\w*|бью|бить|стреля\w*|выстрел\w*|"
-        r"брос\w*|мет\w*|бегу.{0,30}на\b|несусь.{0,30}на\b|"
-        r"бросаюсь.{0,30}на\b|налетаю.{0,30}на\b|кидаюсь.{0,30}на\b)",
+        r"брос\w*|мет\w*|бег\w*.{0,50}(?:на|к|в сторону)\b|"
+        r"нес\w*.{0,50}(?:на|к|в сторону)\b|"
+        r"бросаюсь.{0,50}(?:на|к|в сторону)\b|"
+        r"налетаю.{0,50}(?:на|к|в сторону)\b|"
+        r"кидаюсь.{0,50}(?:на|к|в сторону)\b|"
+        r"заряд\w*.{0,50}(?:на|к|в сторону)\b)",
         action.casefold()
     ))
 
@@ -1079,10 +1083,12 @@ async def handle_action_description(message: types.Message, state: FSMContext):
             initiative_result = None
             if target and (
                 is_attack_action
-                or (enemy_attacks and target.is_hostile)
+                or enemy_attacks
                 or bool(arena_event_text)
             ):
-                if is_attack_action:
+                # The DM's explicit hostile action is itself the authoritative
+                # signal; don't require the model to also set is_hostile perfectly.
+                if is_attack_action or enemy_attacks or arena_event_text:
                     target.is_hostile = True
                     npc_record = db.query(CampaignNPC).filter(
                         CampaignNPC.group_id == character.group_id,
@@ -1359,7 +1365,15 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     "look": "🔎 Вид вокруг",
                 }[scene_image_kind]
                 await _send_generated_image(message.answer_photo, image_prompt, caption)
-            await state.clear()
+            if active_encounter and active_encounter.is_active:
+                await state.set_state(CombatStates.in_combat)
+                await state.update_data(
+                    encounter_id=active_encounter.id,
+                    character_id=character.id,
+                    target_entity_id=target.id
+                )
+            else:
+                await state.clear()
 
         except Exception as ai_error:
             logger.error(f"AI error: {ai_error}")
@@ -1571,114 +1585,11 @@ async def travel_to_location_callback(query: types.CallbackQuery, state: FSMCont
 
 @router.message(Command("fight"))
 async def fight_command(message: types.Message, state: FSMContext):
-    """Fight command - removed, ДМ решает когда боевой раунд"""
+    """Combat is started by the DM during /action, never by a generic /fight."""
     await message.answer(
-        "⚔️ <b>Боевая система</b>\n\n"
-        "Боевые раунды назначает Гейм-Мастер!\n"
-        "Используйте /action для выполнения действий в бою"
+        "Бой начинается по ситуации — когда вы атакуете или противник нападает. "
+        "Опишите намерение через /action."
     )
-    db: Session = SessionLocal()
-    try:
-        # Get user's default group
-        from src.models import Group, GroupMember
-        default_group = db.query(Group).join(
-            GroupMember
-        ).filter(
-            GroupMember.user_id == message.from_user.id,
-            GroupMember.role == "gm"
-        ).first()
-
-        if not default_group:
-            await message.answer(format_error("Создайте персонажа командой /create_character"))
-            return
-
-        # Get character
-        character = db.query(Character).filter(
-            Character.user_id == message.from_user.id,
-            Character.group_id == default_group.id
-        ).first()
-
-        if not character:
-            await message.answer("❌ У вас нет персонажа")
-            return
-
-        # Get session
-        session = db.query(GameSession).filter(
-            GameSession.group_id == default_group.id
-        ).first()
-
-        if not session:
-            await message.answer("❌ Сессия не активна")
-            return
-
-        # Create combat encounter
-        encounter = CombatService.start_combat(
-            db=db,
-            session_id=session.id,
-            location_id=session.current_location_id,
-            enemy_name="Враг",
-            enemy_hp=20,
-            enemy_ac=12
-        )
-
-        # Roll initiative
-        attributes = db.query(CharacterAttribute).filter(
-            CharacterAttribute.character_id == character.id
-        ).first()
-
-        dex_modifier = (attributes.dexterity - 10) // 2
-        player_initiative = CombatService.roll_initiative(dex_modifier)
-        enemy_initiative = CombatService.roll_initiative(0)
-
-        # Add participants
-        CombatService.add_participant(db, encounter.id, character.id, player_initiative, True)
-
-        # Determine turn order
-        player_first = player_initiative > enemy_initiative
-
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⚔️ Атаковать", callback_data=f"attack_in_{encounter.id}")]
-        ])
-
-        combat_text = f"""
-⚔️ <b>БОЕВОЕ СРАЖЕНИЕ!</b>
-
-Инициатива:
-Вы: {player_initiative}
-Враг: {enemy_initiative}
-
-{'🎯 Ваш ход!' if player_first else '⚠️ Враг атакует первым!'}
-
-Враг HP: 20/20
-Ваш HP: {character.current_hp}/{character.max_hp}
-"""
-
-        await message.answer(combat_text, reply_markup=keyboard)
-        await state.set_state(CombatStates.in_combat)
-        await state.update_data(encounter_id=encounter.id, character_id=character.id)
-        location = (
-            db.query(Location).filter(Location.id == session.current_location_id).first()
-            if session.current_location_id else None
-        )
-        battle_prompt = (
-            f"Create a cinematic tabletop role-playing battle map illustration. "
-            f"World style: {default_group.world_description or 'fantasy adventure'}. "
-            f"Location: {location.name if location else 'the current encounter'}. "
-            f"Environment: {location.description if location else 'an arena or encounter area'}. "
-            f"Show {character.name} facing an enemy, with a clear readable battlefield, "
-            "dramatic but coherent lighting. No text, labels, lettering, or interface."
-        )
-        await _send_generated_image(
-            message.answer_photo,
-            battle_prompt,
-            f"⚔️ Поле боя — {location.name}" if location else "⚔️ Поле боя"
-        )
-
-    except Exception as e:
-        logger.error(f"Error starting combat: {e}")
-        await message.answer(format_error(f"Ошибка: {str(e)}"))
-    finally:
-        db.close()
 
 
 @router.callback_query(CombatStates.in_combat, F.data.startswith("attack_in_"))
