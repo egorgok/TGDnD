@@ -83,18 +83,34 @@ class AIService:
                 "response_format": "b64_json"
             }
 
-            async with httpx.AsyncClient(timeout=60) as client:
+            logger.info(
+                "Requesting scene image from %s using model %s",
+                self.settings.ai_image_gateway_url,
+                self.settings.ai_image_model
+            )
+            async with httpx.AsyncClient(timeout=120) as client:
                 response = await client.post(
                     self.settings.ai_image_gateway_url,
                     json=payload,
                     headers=headers
                 )
+                logger.info("Image gateway responded with HTTP %s", response.status_code)
                 response.raise_for_status()
                 data = response.json()
-                return data["data"][0]["b64_json"]
+                image_data = data.get("data") or []
+                if not image_data:
+                    raise ValueError("Image gateway response has no data entries")
+                first_image = image_data[0]
+                if first_image.get("b64_json"):
+                    return first_image["b64_json"]
+                if first_image.get("url"):
+                    image_response = await client.get(first_image["url"])
+                    image_response.raise_for_status()
+                    return base64.b64encode(image_response.content).decode("ascii")
+                raise ValueError("Image gateway response contains neither b64_json nor url")
 
         except Exception as e:
-            logger.error(f"Error generating image: {e}")
+            logger.exception("Error generating image")
             raise
 
     async def validate_action(

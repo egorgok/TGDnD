@@ -37,6 +37,14 @@ def get_or_create_default_group(db: Session, user_id: int) -> Group:
     ).first()
 
     if group:
+        if not group.world_description:
+            group.world_description = (
+                "Классическое средневековое фэнтези: королевства, деревни, замки, "
+                "дороги, мечи, луки и магия. Сохраняй средневековый уровень "
+                "технологий; не вводи современную технику или научную фантастику, "
+                "если игрок явно не пересобрал сеттинг."
+            )
+            db.commit()
         return group
 
     # Create default group
@@ -45,7 +53,13 @@ def get_or_create_default_group(db: Session, user_id: int) -> Group:
         id=default_group_id,
         title=f"Персональная кампания",
         group_type="personal",
-        gm_prompt="Одиночная кампания"
+        gm_prompt="Одиночная кампания",
+        world_description=(
+            "Классическое средневековое фэнтези: королевства, деревни, замки, "
+            "дороги, мечи, луки и магия. Сохраняй исторический средневековый "
+            "уровень технологий; не вводи современную технику или научную "
+            "фантастику, если игрок явно не пересобрал сеттинг."
+        )
     )
     db.add(group)
     db.flush()

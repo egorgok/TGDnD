@@ -22,6 +22,7 @@ from src.services.open5e_localization import canonical_item_name, localized_item
 from src.utils import format_error
 import logging
 import base64
+import httpx
 import re
 import json
 import html
@@ -35,10 +36,23 @@ router = Router()
 async def _send_generated_image(send_photo, prompt: str, caption: str) -> bool:
     """Generate an image and send it without failing the game turn on image errors."""
     try:
-        image_b64 = await AIService().generate_image(prompt=prompt)
-        if not image_b64:
+        image_result = await AIService().generate_image(prompt=prompt)
+        if isinstance(image_result, dict):
+            image_b64 = image_result.get("b64_json")
+            if image_b64:
+                image_bytes = base64.b64decode(image_b64)
+            elif image_result.get("url"):
+                async with httpx.AsyncClient(timeout=60) as client:
+                    response = await client.get(image_result["url"])
+                    response.raise_for_status()
+                    image_bytes = response.content
+            else:
+                image_bytes = None
+        else:
+            image_bytes = base64.b64decode(image_result) if image_result else None
+        if not image_bytes:
             return False
-        image = BufferedInputFile(base64.b64decode(image_b64), filename="scene.png")
+        image = BufferedInputFile(image_bytes, filename="scene.png")
         await send_photo(photo=image, caption=caption[:900])
         return True
     except Exception:
