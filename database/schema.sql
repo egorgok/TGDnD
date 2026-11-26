@@ -128,6 +128,55 @@ CREATE TABLE IF NOT EXISTS npcs (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Persistent people and creatures encountered by a player character
+CREATE TABLE IF NOT EXISTS game_entities (
+    id SERIAL PRIMARY KEY,
+    group_id BIGINT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    character_id INT NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    entity_type VARCHAR(100) NOT NULL DEFAULT 'person',
+    description TEXT,
+    personality TEXT,
+    current_hp INT NOT NULL DEFAULT 10,
+    max_hp INT NOT NULL DEFAULT 10,
+    armor_class INT NOT NULL DEFAULT 10,
+    attack_bonus INT NOT NULL DEFAULT 0,
+    damage_dice VARCHAR(20) NOT NULL DEFAULT 'd4',
+    distance_m INT NOT NULL DEFAULT 5,
+    is_hostile BOOLEAN NOT NULL DEFAULT FALSE,
+    is_alive BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Campaign-wide NPC identities and factual memories
+CREATE TABLE IF NOT EXISTS campaign_npcs (
+    id SERIAL PRIMARY KEY,
+    group_id BIGINT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    aliases TEXT,
+    role VARCHAR(255),
+    description TEXT,
+    personality TEXT,
+    current_location VARCHAR(500),
+    is_hostile BOOLEAN NOT NULL DEFAULT FALSE,
+    is_alive BOOLEAN NOT NULL DEFAULT TRUE,
+    first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_campaign_npcs_group_id ON campaign_npcs(group_id);
+
+CREATE TABLE IF NOT EXISTS npc_memories (
+    id SERIAL PRIMARY KEY,
+    npc_id INT NOT NULL REFERENCES campaign_npcs(id) ON DELETE CASCADE,
+    fact TEXT NOT NULL,
+    source VARCHAR(255),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_npc_memories_npc_id ON npc_memories(npc_id);
+
 -- Game sessions
 CREATE TABLE IF NOT EXISTS game_sessions (
     id SERIAL PRIMARY KEY,

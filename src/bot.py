@@ -33,6 +33,52 @@ class DnDBot:
             logger.error(f"Error initializing database: {e}")
             raise
 
+        # Each deployment has its own database. Ensure the Open5e catalog is
+        # present there instead of relying on a developer machine's one-time import.
+        try:
+            from src.models import DnDRules
+            from src.models.base import SessionLocal
+
+            db = SessionLocal()
+            try:
+                expected_counts = {
+                    "open5e_classes": 12,
+                    "open5e_spells": 100,
+                    "open5e_weapons": 20,
+                    "open5e_armor": 8,
+                    "open5e_items": 100,
+                    "open5e_creatures": 100,
+                    "open5e_rules": 100,
+                }
+                cache_is_ready = all(
+                    db.query(DnDRules.id).filter(
+                        DnDRules.rule_category == category
+                    ).count() >= minimum
+                    for category, minimum in expected_counts.items()
+                )
+            finally:
+                db.close()
+
+            if not cache_is_ready:
+                logger.info("Open5e SRD cache is incomplete; synchronizing it now...")
+
+                def _sync_open5e_in_worker():
+                    from src.models.base import SessionLocal
+                    from src.services.open5e_importer import sync_open5e
+
+                    import_db = SessionLocal()
+                    try:
+                        return sync_open5e(import_db)
+                    finally:
+                        import_db.close()
+
+                counts = await asyncio.to_thread(_sync_open5e_in_worker)
+                logger.info("Open5e SRD cache synchronized: %s", counts)
+        except Exception:
+            # Keep the bot usable during a temporary API/network outage. The
+            # importer can be rerun manually with `python -m src.services.open5e_importer`.
+            logger.exception("Open5e synchronization failed; continuing with cached/local rules")
+
     async def on_startup(self):
         """Run on bot startup"""
         logger.info("Bot starting up...")
@@ -56,11 +102,11 @@ class DnDBot:
         )
 
         # Register routers
-        self.dp.include_router(start.router)
         self.dp.include_router(character.router)
-        self.dp.include_router(profile.router)
         self.dp.include_router(game.router)
+        self.dp.include_router(profile.router)
         self.dp.include_router(group.router)
+        self.dp.include_router(start.router)
 
         logger.info("Handlers registered")
 

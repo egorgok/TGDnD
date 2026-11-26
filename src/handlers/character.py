@@ -5,9 +5,13 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy.orm import Session
 from src.models.base import SessionLocal
-from src.models import Character, User
-from src.services import CharacterService, RulesService
-from src.utils import format_character_sheet, format_error, format_success
+from src.models import Character, User, Group, GroupMember
+from src.services import CharacterService, RulesService, GroupService
+from src.services.open5e_rules_service import (
+    grant_starting_class_data,
+    open5e_class_is_available
+)
+from src.utils import format_error, format_success
 import logging
 
 logger = logging.getLogger(__name__)
@@ -23,13 +27,52 @@ class CharacterCreationStates(StatesGroup):
     confirming = State()
 
 
+def get_or_create_default_group(db: Session, user_id: int) -> Group:
+    """Get or create default group for user"""
+    group = db.query(Group).join(
+        GroupMember
+    ).filter(
+        GroupMember.user_id == user_id,
+        GroupMember.role == "gm"
+    ).first()
+
+    if group:
+        return group
+
+    # Create default group
+    default_group_id = user_id
+    group = Group(
+        id=default_group_id,
+        title=f"Персональная кампания",
+        group_type="personal",
+        gm_prompt="Одиночная кампания"
+    )
+    db.add(group)
+    db.flush()
+
+    member = GroupMember(
+        group_id=default_group_id,
+        user_id=user_id,
+        role="gm"
+    )
+    db.add(member)
+    db.commit()
+
+    return group
+
+
+@router.callback_query(F.data == "create_character")
+async def create_character_callback(query: types.CallbackQuery, state: FSMContext):
+    await query.answer()
+    msg = query.message.model_copy(update={"from_user": query.from_user})
+    await create_character_command(msg, state)
+
+
 @router.message(Command("create_character"))
 async def create_character_command(message: types.Message, state: FSMContext):
     """Start character creation process"""
     db: Session = SessionLocal()
     try:
-        # Check if user already has character in this group
-        # For now, just proceed with creation
         user = db.query(User).filter(User.id == message.from_user.id).first()
         if not user:
             user = User(
@@ -39,6 +82,9 @@ async def create_character_command(message: types.Message, state: FSMContext):
             )
             db.add(user)
             db.commit()
+
+        # Get or create personal group
+        group = get_or_create_default_group(db, message.from_user.id)
 
         # Get available races
         races = RulesService.get_all_races()
@@ -55,6 +101,7 @@ async def create_character_command(message: types.Message, state: FSMContext):
             reply_markup=keyboard
         )
         await state.set_state(CharacterCreationStates.choosing_race)
+        await state.update_data(group_id=group.id)
 
     except Exception as e:
         logger.error(f"Error in create_character_command: {e}")
@@ -138,37 +185,94 @@ async def choose_name_message(message: types.Message, state: FSMContext):
 
     await state.update_data(name=name)
 
-    # Generate base attributes (standard array: 15, 14, 13, 12, 10, 8)
-    base_attributes = {
-        "str": 15,
-        "dex": 14,
-        "con": 13,
-        "int": 12,
-        "wis": 10,
-        "cha": 8
-    }
+    # Show attribute distribution screen
+    attributes_text = f"""
+🧙 <b>Создание персонажа</b>
 
-    # Apply racial modifiers
-    final_attributes = RulesService.apply_ability_modifiers(base_attributes, race)
+<b>Раса:</b> {race}
+<b>Класс:</b> {class_name}
+<b>Имя:</b> {name}
 
-    await state.update_data(attributes=final_attributes)
+Шаг 4: <b>Распределение характеристик</b>
 
-    # Show confirmation
-    race_info = RulesService.get_race_info(race)
-    class_info = RulesService.get_class_info(class_name)
-    starting_hp = class_info["starting_hp"] + (final_attributes["con"] - 10) // 2
+Вы берете готовый набор чисел:
+<b>15, 14, 13, 12, 10, 8</b>
 
-    confirmation_text = f"""
+И распределяете их между характеристиками:
+• <b>STR</b> (Сила) - боевые атаки, прыжки
+• <b>DEX</b> (Ловкость) - инициатива, защита
+• <b>CON</b> (Телосложение) - здоровье
+• <b>INT</b> (Интеллект) - знания, логика
+• <b>WIS</b> (Мудрость) - восприятие, магия
+• <b>CHA</b> (Харизма) - общение, влияние
+
+Напишите 6 чисел через запятую в порядке:
+STR, DEX, CON, INT, WIS, CHA
+
+Пример: 15, 14, 13, 12, 10, 8
+"""
+
+    await message.answer(attributes_text)
+    await state.set_state(CharacterCreationStates.distributing_attributes)
+
+
+@router.message(CharacterCreationStates.distributing_attributes)
+async def distribute_attributes_message(message: types.Message, state: FSMContext):
+    """Handle attribute distribution"""
+    text = message.text.strip()
+
+    try:
+        # Parse attributes
+        attr_values = [int(x.strip()) for x in text.split(",")]
+
+        if len(attr_values) != 6:
+            await message.answer("❌ Нужно ровно 6 чисел через запятую")
+            return
+
+        # Check if it's the correct array
+        if sorted(attr_values, reverse=True) != [15, 14, 13, 12, 10, 8]:
+            await message.answer(
+                "❌ Числа должны быть: 15, 14, 13, 12, 10, 8\n"
+                "(в любом порядке)"
+            )
+            return
+
+        attributes = {
+            "str": attr_values[0],
+            "dex": attr_values[1],
+            "con": attr_values[2],
+            "int": attr_values[3],
+            "wis": attr_values[4],
+            "cha": attr_values[5],
+        }
+
+        data = await state.get_data()
+        race = data.get("race")
+        class_name = data.get("class_")
+        name = data.get("name")
+
+        # Apply racial modifiers
+        final_attributes = RulesService.apply_ability_modifiers(attributes, race)
+
+        await state.update_data(attributes=final_attributes)
+
+        # Show confirmation
+        race_info = RulesService.get_race_info(race)
+        class_info = RulesService.get_class_info(class_name)
+        con_mod = (final_attributes["con"] - 10) // 2
+        starting_hp = class_info["starting_hp"] + con_mod
+
+        confirmation_text = f"""
 🧙 <b>Подтверждение персонажа</b>
 
 <b>Имя:</b> {name}
 <b>Раса:</b> {race}
 <b>Класс:</b> {class_name}
 
-<b>📊 Характеристики:</b>
+<b>📊 Характеристики (с модификаторами расы):</b>
 STR: {final_attributes['str']} ({(final_attributes['str']-10)//2:+d})
 DEX: {final_attributes['dex']} ({(final_attributes['dex']-10)//2:+d})
-CON: {final_attributes['con']} ({(final_attributes['con']-10)//2:+d})
+CON: {final_attributes['con']} ({con_mod:+d})
 INT: {final_attributes['int']} ({(final_attributes['int']-10)//2:+d})
 WIS: {final_attributes['wis']} ({(final_attributes['wis']-10)//2:+d})
 CHA: {final_attributes['cha']} ({(final_attributes['cha']-10)//2:+d})
@@ -178,15 +282,18 @@ CHA: {final_attributes['cha']} ({(final_attributes['cha']-10)//2:+d})
 Всё правильно?
 """
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Создать", callback_data="confirm_create"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_create")
-        ]
-    ])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Создать", callback_data="confirm_create"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_create")
+            ]
+        ])
 
-    await message.answer(confirmation_text, reply_markup=keyboard)
-    await state.set_state(CharacterCreationStates.confirming)
+        await message.answer(confirmation_text, reply_markup=keyboard)
+        await state.set_state(CharacterCreationStates.confirming)
+
+    except ValueError:
+        await message.answer("❌ Введите 6 чисел через запятую\nПример: 15, 14, 13, 12, 10, 8")
 
 
 @router.callback_query(CharacterCreationStates.confirming, F.data == "confirm_create")
@@ -200,15 +307,24 @@ async def confirm_create_callback(query: types.CallbackQuery, state: FSMContext)
         class_name = data.get("class_")
         attributes = data.get("attributes")
 
+        if not open5e_class_is_available(db, class_name):
+            await query.message.edit_text(
+                "❌ Стартовые данные Open5e ещё не загружены.\n\n"
+                "Перезапустите бота, дождитесь завершения синхронизации правил "
+                "и нажмите «Создать» ещё раз. Персонаж пока не создан."
+            )
+            await query.answer()
+            return
+
         class_info = RulesService.get_class_info(class_name)
         con_modifier = (attributes["con"] - 10) // 2
         starting_hp = class_info["starting_hp"] + con_modifier
 
-        # Create character (using group_id = 0 for now, will be updated in group functionality)
+        # Create character with user_id as group_id (dummy group for solo play)
         character = CharacterService.create_character(
             db=db,
             user_id=query.from_user.id,
-            group_id=0,  # Default group
+            group_id=query.from_user.id,  # Use user_id as group_id for solo play
             name=name,
             race=race,
             class_=class_name,
@@ -217,9 +333,15 @@ async def confirm_create_callback(query: types.CallbackQuery, state: FSMContext)
         )
 
         if character:
+            starting_data = grant_starting_class_data(db, character)
             await query.message.edit_text(
                 format_success(f"✅ Персонаж {name} создан успешно!\n\n")
-                + f"Используй /profile для просмотра профиля"
+                + (
+                    f"Стартовые особенности: {starting_data['features']}\n"
+                    f"Предметы: {starting_data['items']}\n"
+                    f"Заклинания: {starting_data['spells']}\n\n"
+                    "Используй /profile для просмотра листа персонажа"
+                )
             )
             await state.clear()
         else:

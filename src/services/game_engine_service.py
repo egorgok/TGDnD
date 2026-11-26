@@ -51,6 +51,50 @@ class GameEngineService:
             return 6
 
     @staticmethod
+    def calculate_armor_class(character: Character, attributes, db: Session) -> int:
+        """Calculate AC from SRD armor rules, with class unarmored defense."""
+        dexterity_modifier = (attributes.dexterity - 10) // 2 if attributes else 0
+        wisdom_modifier = (attributes.wisdom - 10) // 2 if attributes else 0
+        constitution_modifier = (attributes.constitution - 10) // 2 if attributes else 0
+        equipped_items = (
+            db.query(Item.item_type, Item.armor_class)
+            .join(Inventory, Inventory.item_id == Item.id)
+            .filter(
+                Inventory.character_id == character.id,
+                Inventory.is_equipped.is_(True),
+                Item.armor_class.isnot(None)
+            )
+            .all()
+        )
+        if equipped_items:
+            body_armor = next(
+                ((item_type, armor_base) for item_type, armor_base in equipped_items
+                 if (item_type or "").startswith("armor:")),
+                None
+            )
+            has_shield = any(item_type == "shield" for item_type, _ in equipped_items)
+            if body_armor:
+                item_type, armor_base = body_armor
+                category = item_type.partition(":")[2]
+                if category == "light":
+                    armor = int(armor_base) + dexterity_modifier
+                elif category == "medium":
+                    armor = int(armor_base) + min(dexterity_modifier, 2)
+                else:
+                    armor = int(armor_base)
+                return armor + (2 if has_shield else 0)
+
+        if character.class_ == "Варвар":
+            return 10 + dexterity_modifier + constitution_modifier + (
+                2 if equipped_items and any(item_type == "shield" for item_type, _ in equipped_items) else 0
+            )
+        if character.class_ == "Монах":
+            return 10 + dexterity_modifier + wisdom_modifier
+        if equipped_items and any(item_type == "shield" for item_type, _ in equipped_items):
+            return 10 + dexterity_modifier + 2
+        return 10 + dexterity_modifier
+
+    @staticmethod
     def apply_damage(character: Character, damage_amount: int, db: Session) -> Tuple[bool, str]:
         """
         Apply damage to character

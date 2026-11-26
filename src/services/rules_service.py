@@ -12,140 +12,140 @@ class RulesService:
 
     # Base D&D 5e races with ability modifiers
     RACES = {
-        "Human": {
+        "Человек": {
             "ability_mods": {
                 "str": 1, "dex": 1, "con": 1, "int": 1, "wis": 1, "cha": 1
             },
             "hp_bonus": 0,
-            "starting_abilities": ["Versatility"]
+            "starting_abilities": ["Универсальность"]
         },
-        "Elf": {
+        "Эльф": {
             "ability_mods": {"str": 0, "dex": 2, "con": 0, "int": 0, "wis": 0, "cha": 0},
             "hp_bonus": 0,
-            "starting_abilities": ["Keen Senses", "Fey Ancestry", "Trance"]
+            "starting_abilities": ["Острое восприятие", "Фейское происхождение", "Транс"]
         },
-        "Dwarf": {
+        "Дворф": {
             "ability_mods": {"str": 0, "dex": 0, "con": 2, "int": 0, "wis": 1, "cha": 0},
             "hp_bonus": 1,
-            "starting_abilities": ["Dwarven Resilience", "Dwarven Combat Training"]
+            "starting_abilities": ["Дварфийская устойчивость", "Дварфийское боевое мастерство"]
         },
-        "Halfling": {
+        "Полурослик": {
             "ability_mods": {"str": 0, "dex": 2, "con": 0, "int": 0, "wis": 0, "cha": 1},
             "hp_bonus": 0,
-            "starting_abilities": ["Lucky", "Brave", "Halfling Nimbleness"]
+            "starting_abilities": ["Везунчик", "Храбрость", "Полуросликовая ловкость"]
         },
-        "Dragonborn": {
+        "Драконорожденный": {
             "ability_mods": {"str": 2, "dex": 0, "con": 1, "int": 0, "wis": 0, "cha": 1},
             "hp_bonus": 0,
-            "starting_abilities": ["Draconic Ancestry", "Breath Weapon"]
+            "starting_abilities": ["Драконье происхождение", "Дыхание"]
         },
-        "Gnome": {
+        "Гном": {
             "ability_mods": {"str": 0, "dex": 0, "con": 1, "int": 2, "wis": 0, "cha": 0},
             "hp_bonus": 0,
-            "starting_abilities": ["Gnome Cunning"]
+            "starting_abilities": ["Гномская хитрость"]
         },
-        "Half-Elf": {
+        "Полуэльф": {
             "ability_mods": {"str": 0, "dex": 0, "con": 0, "int": 0, "wis": 0, "cha": 2},
             "hp_bonus": 0,
-            "starting_abilities": ["Fey Ancestry", "Skill Versatility"]
+            "starting_abilities": ["Фейское происхождение", "Универсальность навыков"]
         },
-        "Half-Orc": {
+        "Полуорк": {
             "ability_mods": {"str": 2, "dex": 0, "con": 1, "int": -2, "wis": 0, "cha": 0},
             "hp_bonus": 1,
-            "starting_abilities": ["Menacing", "Relentless Endurance"]
+            "starting_abilities": ["Угрожающий вид", "Неустанная стойкость"]
         },
-        "Tiefling": {
+        "Тифлинг": {
             "ability_mods": {"str": 0, "dex": 0, "con": 0, "int": 1, "wis": 0, "cha": 2},
             "hp_bonus": 0,
-            "starting_abilities": ["Infernal Resistance", "Innate Spellcasting"]
+            "starting_abilities": ["Адское сопротивление", "Врождённое колдовство"]
         }
     }
 
     # Base D&D 5e classes
     CLASSES = {
-        "Barbarian": {
+        "Варвар": {
             "hit_dice": "d12",
             "starting_hp": 12,
             "armor": ["light", "medium", "shields"],
             "weapons": "simple, martial",
-            "starting_abilities": ["Rage", "Unarmored Defense"]
+            "starting_abilities": ["Ярость", "Неармированная защита"]
         },
-        "Bard": {
+        "Бард": {
             "hit_dice": "d8",
             "starting_hp": 8,
             "armor": ["light"],
             "weapons": "simple, hand crossbows, longswords, rapiers, shortswords",
-            "starting_abilities": ["Spellcasting", "Bardic Inspiration"]
+            "starting_abilities": ["Колдовство", "Вдохновение барда"]
         },
-        "Cleric": {
+        "Жрец": {
             "hit_dice": "d8",
             "starting_hp": 8,
             "armor": ["light", "medium", "heavy", "shields"],
             "weapons": "simple",
-            "starting_abilities": ["Spellcasting", "Channel Divinity"]
+            "starting_abilities": ["Колдовство", "Божественный канал"]
         },
-        "Druid": {
+        "Друид": {
             "hit_dice": "d8",
             "starting_hp": 8,
             "armor": ["light", "medium"],
             "weapons": "clubs, daggers, darts, javelins, maces, quarterstaffs, scimitars, sickles, slings, spears",
-            "starting_abilities": ["Spellcasting", "Wild Shape"]
+            "starting_abilities": ["Колдовство", "Дикий облик"]
         },
-        "Fighter": {
+        "Боец": {
             "hit_dice": "d10",
             "starting_hp": 10,
             "armor": ["all", "shields"],
             "weapons": "simple, martial",
-            "starting_abilities": ["Fighting Style", "Second Wind"]
+            "starting_abilities": ["Боевой стиль", "Второе дыхание"]
         },
-        "Monk": {
+        "Монах": {
             "hit_dice": "d8",
             "starting_hp": 8,
             "armor": ["none"],
             "weapons": "simple, shortswords",
-            "starting_abilities": ["Unarmored Defense", "Martial Arts"]
+            "starting_abilities": ["Неармированная защита", "Боевые искусства"]
         },
-        "Paladin": {
+        "Паладин": {
             "hit_dice": "d10",
             "starting_hp": 10,
             "armor": ["all", "shields"],
             "weapons": "simple, martial",
-            "starting_abilities": ["Divine Sense", "Lay on Hands"]
+            "starting_abilities": ["Божественное чувство", "Возложение рук"]
         },
-        "Ranger": {
+        "Рейнджер": {
             "hit_dice": "d10",
             "starting_hp": 10,
             "armor": ["light", "medium"],
             "weapons": "simple, martial",
-            "starting_abilities": ["Favored Enemy", "Natural Explorer"]
+            "starting_abilities": ["Любимый враг", "Естественный путник"]
         },
-        "Rogue": {
+        "Плут": {
             "hit_dice": "d8",
             "starting_hp": 8,
             "armor": ["light"],
             "weapons": "simple hand crossbows, longswords, rapiers, shortswords",
-            "starting_abilities": ["Expertise", "Sneak Attack"]
+            "starting_abilities": ["Опыт", "Коварная атака"]
         },
-        "Sorcerer": {
+        "Чародей": {
             "hit_dice": "d6",
             "starting_hp": 6,
             "armor": ["none"],
             "weapons": "simple",
-            "starting_abilities": ["Spellcasting", "Sorcerous Origin"]
+            "starting_abilities": ["Колдовство", "Происхождение чародея"]
         },
-        "Warlock": {
+        "Волшебник": {
+            "hit_dice": "d6",
+            "starting_hp": 6,
+            "armor": ["none"],
+            "weapons": "simple",
+            "starting_abilities": ["Колдовство", "Восстановление магии"]
+        },
+        "Ведьмак": {
             "hit_dice": "d8",
             "starting_hp": 8,
             "armor": ["light"],
             "weapons": "simple",
-            "starting_abilities": ["Spellcasting", "Otherworldly Patron"]
-        },
-        "Wizard": {
-            "hit_dice": "d6",
-            "starting_hp": 6,
-            "armor": ["none"],
-            "weapons": "simple",
-            "starting_abilities": ["Spellcasting", "Arcane Recovery"]
+            "starting_abilities": ["Колдовство", "Потусторонний патрон"]
         }
     }
 

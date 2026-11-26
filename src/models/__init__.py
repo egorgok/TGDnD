@@ -7,6 +7,8 @@ from .session import GameSession
 from .action import ActionHistory
 from .rules import DnDRules
 from .combat import CombatEncounter, CombatParticipant
+from .entity import GameEntity
+from .campaign_npc import CampaignNPC, NPCMemory
 
 __all__ = [
     "User",
@@ -26,4 +28,7 @@ __all__ = [
     "DnDRules",
     "CombatEncounter",
     "CombatParticipant",
+    "GameEntity",
+    "CampaignNPC",
+    "NPCMemory",
 ]

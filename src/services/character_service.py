@@ -23,16 +23,16 @@ class CharacterService:
     ) -> Optional[Character]:
         """Create a new character"""
         try:
-            # Check if character already exists for this user in this group
+            # Check if character with this name already exists for this user
             existing = db.query(Character).filter(
                 and_(
                     Character.user_id == user_id,
-                    Character.group_id == group_id
+                    Character.name == name
                 )
             ).first()
 
             if existing:
-                logger.warning(f"Character already exists for user {user_id} in group {group_id}")
+                logger.warning(f"Character {name} already exists for user {user_id}")
                 return None
 
             character = Character(

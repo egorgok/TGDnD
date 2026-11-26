@@ -26,17 +26,52 @@ class GroupJoinStates(StatesGroup):
     entering_code = State()
 
 
-@router.message(Command("create_group"))
-async def create_group_command(message: types.Message, state: FSMContext):
-    """Start group creation"""
+@router.message(F.chat.type.in_(["group", "supergroup"]))
+async def group_message_handler(message: types.Message, state: FSMContext):
+    """Handle messages in group chats"""
+    # Bot added to group
+    if message.new_chat_members:
+        for member in message.new_chat_members:
+            if member.is_bot:
+                await message.answer(
+                    "🗺️ <b>Добро пожаловать в D&D RPG Bot!</b>\n\n"
+                    "Я готов помочь вам провести эпическую кампанию!\n\n"
+                    "Используйте /setup_campaign для настройки кампании в этом чате"
+                )
+                break
+
+
+@router.message(Command("setup_campaign"))
+async def setup_campaign_command(message: types.Message, state: FSMContext):
+    """Setup campaign in group chat"""
+    # Only works in group chats
+    if message.chat.type not in ["group", "supergroup"]:
+        await message.answer("❌ Эта команда работает только в групповых чатах")
+        return
+
     db: Session = SessionLocal()
     try:
+        logger.info(f"setup_campaign called in chat {message.chat.id} by user {message.from_user.id}")
+
+        # Check if campaign already exists for this chat
+        existing_group = db.query(Group).filter(Group.id == message.chat.id).first()
+        if existing_group:
+            await message.answer(f"ℹ️ Кампания <b>{existing_group.title}</b> уже настроена")
+            return
+
         await message.answer(
-            "🗺️ <b>Создание новой группы/кампании</b>\n\n"
-            "Шаг 1: Введите название группы\n"
+            "🗺️ <b>Настройка кампании</b>\n\n"
+            "Шаг 1: Введите название кампании\n"
             "(Например: 'Забытые подземелья', 'Королевство Аулерона')"
         )
         await state.set_state(GroupCreationStates.entering_title)
+        # Store that we're in a group
+        await state.update_data(is_group_chat=True, group_chat_id=message.chat.id, gm_user_id=message.from_user.id)
+        logger.info(f"State set to entering_title for group {message.chat.id}")
+
+    except Exception as e:
+        logger.error(f"Error in setup_campaign: {e}", exc_info=True)
+        await message.answer(f"❌ Ошибка: {str(e)}")
     finally:
         db.close()
 
@@ -80,7 +115,7 @@ async def handle_world_prompt(message: types.Message, state: FSMContext):
 <b>Описание мира:</b>
 {world_prompt}
 
-Создать группу?
+Создать группу и групповой чат в Telegram?
 """
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -96,24 +131,46 @@ async def handle_world_prompt(message: types.Message, state: FSMContext):
 
 @router.callback_query(GroupCreationStates.confirming, F.data == "confirm_create_group")
 async def confirm_create_group_callback(query: types.CallbackQuery, state: FSMContext):
-    """Create group"""
+    """Create group and Telegram chat"""
     db: Session = SessionLocal()
     try:
         data = await state.get_data()
         title = data.get("title")
         world_prompt = data.get("world_prompt")
+        is_group_chat = data.get("is_group_chat", False)
+        group_chat_id = data.get("group_chat_id")
+        gm_user_id = data.get("gm_user_id")
+
+        logger.info(f"Creating group: title={title}, is_group_chat={is_group_chat}, group_chat_id={group_chat_id}")
 
         # Use Telegram group ID or create unique ID
-        group_id = query.message.chat.id if query.message.chat.type == "group" else query.from_user.id * 1000 + 1
+        if is_group_chat and group_chat_id:
+            group_id = group_chat_id
+            await query.message.answer(f"🗺️ <b>Создание кампании...</b>")
+        else:
+            # Personal group creation (deprecated flow, but keep for compatibility)
+            group_id = abs(hash(f"{query.from_user.id}_{title}")) % (10**9)
 
-        # Create group
+        # Create group in DB
         group = GroupService.create_group(
             db=db,
             group_id=group_id,
             title=title,
             gm_prompt=world_prompt,
-            created_by_user_id=query.from_user.id
+            created_by_user_id=gm_user_id or query.from_user.id
         )
+
+        logger.info(f"Group created: id={group.id}, title={group.title}")
+
+        # Add creator as GM
+        member = GroupService.add_member(
+            db=db,
+            group_id=group_id,
+            user_id=gm_user_id or query.from_user.id,
+            role="gm"
+        )
+
+        logger.info(f"Creator added as GM: user_id={gm_user_id or query.from_user.id}")
 
         # Create starting location
         start_location = GroupService.create_location(
@@ -124,6 +181,8 @@ async def confirm_create_group_callback(query: types.CallbackQuery, state: FSMCo
             location_type="starting"
         )
 
+        logger.info(f"Starting location created: id={start_location.id}")
+
         # Initialize game session
         game_session = GroupService.initialize_game_session(
             db=db,
@@ -131,15 +190,19 @@ async def confirm_create_group_callback(query: types.CallbackQuery, state: FSMCo
             starting_location_id=start_location.id
         )
 
-        await query.message.edit_text(
-            format_success(f"✅ Группа <b>{title}</b> создана!\n\n")
-            + f"ID группы: <code>{group_id}</code>\n"
-            + "Используй /join_group для присоединения других игроков"
-        )
+        logger.info(f"Game session initialized: id={game_session.id}")
+
+        success_msg = f"✅ Кампания <b>{title}</b> создана!\n\n"
+        if is_group_chat:
+            success_msg += f"📱 Кампания настроена в этом чате\n"
+        success_msg += f"ID кампании: <code>{group_id}</code>\n\n"
+        success_msg += "Игроки могут присоединиться с помощью /join_group"
+
+        await query.message.edit_text(format_success(success_msg))
         await state.clear()
 
     except Exception as e:
-        logger.error(f"Error creating group: {e}")
+        logger.error(f"Error creating group: {e}", exc_info=True)
         await query.message.edit_text(format_error(f"Ошибка: {str(e)}"))
     finally:
         db.close()
@@ -236,12 +299,18 @@ async def group_info_command(message: types.Message):
             members_count = len(members)
             player_count = len([m for m in members if m.role == "player"])
 
+            # Count characters
+            characters = db.query(Character).filter(
+                Character.group_id == membership.group_id
+            ).count()
+
             info_text = f"""
 <b>🗺️ {group.title}</b>
 
 <b>ID:</b> <code>{group.id}</code>
 <b>Роль:</b> {membership.role}
 <b>Участники:</b> {members_count} (игроков: {player_count})
+<b>Персонажей:</b> {characters}
 
 <b>Описание мира:</b>
 {group.gm_prompt}

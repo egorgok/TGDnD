@@ -3,8 +3,13 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy.orm import Session
 from src.models.base import SessionLocal
-from src.models import Character, CharacterAttribute, Inventory, Item
+from src.models import (
+    Character, CharacterAttribute, CharacterAbility, CharacterSpell,
+    Inventory, Item, GroupMember
+)
 from src.services import CharacterService
+from src.services import GameEngineService
+from src.services.open5e_localization import localized_feature_description
 from src.utils import format_error
 import logging
 
@@ -17,10 +22,30 @@ async def profile_command(message: types.Message):
     """Show character profile"""
     db: Session = SessionLocal()
     try:
-        # Get character for this user (from default group 0)
+        # Get user's default group
+        from src.models import Group, GroupMember
+        default_group = db.query(Group).join(
+            GroupMember
+        ).filter(
+            GroupMember.user_id == message.from_user.id,
+            GroupMember.role == "gm"
+        ).first()
+
+        if not default_group:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🧙 Создать персонажа", callback_data="create_character")]
+            ])
+            await message.answer(
+                "📋 У вас нет персонажа\n\n"
+                "Создайте своего персонажа, чтобы начать играть",
+                reply_markup=keyboard
+            )
+            return
+
+        # Get character for this user
         character = db.query(Character).filter(
             Character.user_id == message.from_user.id,
-            Character.group_id == 0
+            Character.group_id == default_group.id
         ).first()
 
         if not character:
@@ -38,11 +63,19 @@ async def profile_command(message: types.Message):
         attributes = db.query(CharacterAttribute).filter(
             CharacterAttribute.character_id == character.id
         ).first()
+        armor_class = GameEngineService.calculate_armor_class(character, attributes, db)
 
         # Get inventory
         inventory = db.query(Inventory).filter(
             Inventory.character_id == character.id
         ).all()
+        abilities = db.query(CharacterAbility).filter(
+            CharacterAbility.character_id == character.id,
+            CharacterAbility.is_class.is_(True)
+        ).all()
+        spells = db.query(CharacterSpell).filter(
+            CharacterSpell.character_id == character.id
+        ).order_by(CharacterSpell.spell_level, CharacterSpell.spell_name).all()
 
         # Format profile
         profile_text = f"""
@@ -56,6 +89,7 @@ async def profile_command(message: types.Message):
 
 <b>❤️ Здоровье:</b>
 {character.current_hp}/{character.max_hp} HP
+<b>🛡️ Класс защиты:</b> {armor_class}
 
 <b>📊 Характеристики:</b>
 <b>STR</b> {attributes.strength} ({(attributes.strength-10)//2:+d})
@@ -76,12 +110,26 @@ async def profile_command(message: types.Message):
         else:
             profile_text += "\nПуст"
 
+        if abilities:
+            profile_text += "\n\n<b>✨ Особенности класса:</b>"
+            for ability in abilities:
+                profile_text += f"\n• <b>{ability.ability_name}</b>"
+                description = localized_feature_description(
+                    ability.ability_name,
+                    ability.ability_description or ""
+                )
+                if description:
+                    profile_text += f"\n  {description}"
+
+        if spells:
+            profile_text += "\n\n<b>🔮 Заклинания:</b>"
+            for spell in spells:
+                prepared = " ✓" if spell.is_prepared else ""
+                level = "заговор" if spell.spell_level == 0 else f"{spell.spell_level} ур."
+                profile_text += f"\n• {spell.spell_name} ({level}){prepared}"
+
         # Create action buttons
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📦 Инвентарь", callback_data="show_inventory"),
-                InlineKeyboardButton(text="🗡️ Способности", callback_data="show_abilities")
-            ],
             [
                 InlineKeyboardButton(text="🔄 Удалить персонажа", callback_data="delete_character")
             ]
@@ -103,7 +151,11 @@ async def show_inventory_callback(query: types.CallbackQuery):
     try:
         character = db.query(Character).filter(
             Character.user_id == query.from_user.id,
-            Character.group_id == 0
+            Character.group_id.in_(
+                db.query(GroupMember.group_id).filter(
+                    GroupMember.user_id == query.from_user.id
+                )
+            )
         ).first()
 
         if not character:
@@ -151,7 +203,11 @@ async def show_abilities_callback(query: types.CallbackQuery):
 
         character = db.query(Character).filter(
             Character.user_id == query.from_user.id,
-            Character.group_id == 0
+            Character.group_id.in_(
+                db.query(GroupMember.group_id).filter(
+                    GroupMember.user_id == query.from_user.id
+                )
+            )
         ).first()
 
         if not character:
@@ -226,7 +282,11 @@ async def confirm_delete_callback(query: types.CallbackQuery):
     try:
         character = db.query(Character).filter(
             Character.user_id == query.from_user.id,
-            Character.group_id == 0
+            Character.group_id.in_(
+                db.query(GroupMember.group_id).filter(
+                    GroupMember.user_id == query.from_user.id
+                )
+            )
         ).first()
 
         if not character:
