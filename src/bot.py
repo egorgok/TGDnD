@@ -3,6 +3,7 @@ import asyncio
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
 from config.settings import get_settings
 from src.models.base import engine, Base
 
@@ -16,11 +17,12 @@ logger = logging.getLogger(__name__)
 class DnDBot:
     def __init__(self):
         self.settings = get_settings()
+        self.storage = MemoryStorage()
         self.bot = Bot(
             token=self.settings.telegram_bot_token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML)
         )
-        self.dp = Dispatcher()
+        self.dp = Dispatcher(storage=self.storage)
 
     async def init_db(self):
         """Initialize database tables"""
@@ -40,6 +42,7 @@ class DnDBot:
     async def on_shutdown(self):
         """Run on bot shutdown"""
         logger.info("Bot shutting down...")
+        await self.storage.close()
         await self.bot.session.close()
 
     def register_handlers(self):
