@@ -9,6 +9,8 @@ from .rules import DnDRules
 from .combat import CombatEncounter, CombatParticipant
 from .entity import GameEntity
 from .campaign_npc import CampaignNPC, NPCMemory
+from .currency import CharacterCurrency
+from .campaign_quest import CampaignQuest
 
 __all__ = [
     "User",
@@ -31,4 +33,6 @@ __all__ = [
     "GameEntity",
     "CampaignNPC",
     "NPCMemory",
+    "CharacterCurrency",
+    "CampaignQuest",
 ]

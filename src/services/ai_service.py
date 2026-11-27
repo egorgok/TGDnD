@@ -180,6 +180,7 @@ Is this action possible? What are the consequences?"""
         recent_actions: Optional[list] = None,
         known_entities: Optional[list] = None,
         known_npcs: Optional[list] = None,
+        currency: Optional[dict] = None,
         rules_context: Optional[str] = None,
         creature_catalog: Optional[str] = None,
         item_catalog: Optional[str] = None
@@ -224,6 +225,7 @@ and "loot" (array of objects with name, type, rarity, description, quantity)
 and "damage" (integer HP damage to apply, 0 if there is no plausible injury)
 and "damage_dice" (dice only, e.g. "6d6"; otherwise null)
 and "damage_bonus" (separate integer modifier; do not include it in damage_dice)
+and "currency" (coins gained or spent this action: integer gold, silver, copper deltas)
 and "scene_state" (short Russian summary of the character's exact current location,
 position, and immediate situation after this action)
 and "location_changed" (true only if the character actually moved to a different named place)
@@ -242,7 +244,8 @@ and "target_name" (known entity this action targets, otherwise null)
 and "enemy_attacks" (true only when a present hostile creature actually attacks now).
 and "npcs" (new or revisited NPC records with name, aliases, role, description,
 personality, current_location, is_hostile, is_alive) and "npc_memories" (new factual
-memories, each with npc_name, fact, source).
+memories, each with npc_name, fact, source), "quest_offers" (npc_name, title,
+description, reward_xp), and "quest_completions" (npc_name, title).
 Put items in loot ONLY when the character actually finds/receives them in this action.
 If your narrative says the character picks an item up, takes it, keeps it, or puts it
 in a bag/pocket, that item MUST be included in loot using its exact name.
@@ -265,6 +268,12 @@ Every action involving waiting, traveling, searching, approaching, or pursuing m
 advance the situation. Never return another empty "you wait" result: an arrival,
 discovery, interruption, concrete time change, or clear obstacle must occur. Repeated
 waiting must advance or escalate the event, not repeat the previous response.
+Keep the world lively and proactive: seed the scene with people to meet, rumors,
+requests, rivalries, discoveries, environmental changes, and meaningful choices.
+After roughly every 2-3 quiet player actions, introduce a fitting new complication,
+opportunity, or encounter without waiting for the player to invent everything.
+Vary the hooks, make them arise naturally from the established setting, and do not
+force combat every time. Offer a concrete next lead or decision in the narration.
 In an arena/gladiator setting, when the player waits for an opponent, bring one into
 the arena in this response, create it as a persistent NPC and combat entity with stable
 stats, and begin the confrontation. Never make the player repeat the wait action.
@@ -272,6 +281,15 @@ Keep known people and creatures consistent; do not recreate them. When introduci
 named or noteworthy person/creature that can be interacted with, create plausible
 stable stats once and include them in entities in this response. For unclear references
 like "him", choose a target only if exactly one known entity is present in the scene.
+Make the world feel populated with purposes: when a non-hostile named NPC is first met,
+you MUST give them a fitting quest, favor, lead, or request unless they are clearly
+incapable of offering one. Check known NPC quest history first and never repeat an offer
+already recorded. Keep quests concrete, achievable, and tied to the NPC and setting.
+Offer reasonable XP (usually 50-300 for a modest local task, more only for a genuinely
+dangerous major objective), include it in quest_offers, and mention the offer in the
+narrative. Return quest_completions only when the action clearly fulfills a recorded
+active quest; never award XP for merely accepting or discussing it.
+When reporting quest_completions, copy the exact stored NPC name and quest title.
 Do not narrate an attack as a hit; the game system resolves attacks against stored AC/HP.
 Whenever an encountered creature exactly matches the supplied Open5e SRD creature catalog,
 include its exact key as open5e_key; do not make up a key. The bot will use that official
@@ -290,10 +308,15 @@ the encounter begin now rather than waiting for a /fight command.
 Only set add_to_inventory when the item is already owned or is acquired in this scene.
 For a custom spell, return it only if the player provided all required mechanics; otherwise
 explain what details are missing and leave custom_spells empty.
+Award or deduct currency only when the fiction supports it (payment, purchase, reward,
+found purse, etc.); otherwise all currency deltas must be zero. Never create money
+without an in-world source, and never spend more than the current purse.
+Use D&D exchange rates: 10 copper = 1 silver, 10 silver = 1 gold.
 Do not invent loot for ordinary actions. Never list items already in the character inventory."""
 
         prompt = f"""Player: {character_name}
 Current inventory: {inventory or []}
+Current purse: {currency or {"gold": 0, "silver": 0, "copper": 0}}
 Open5e item catalog (Russian display name [canonical DB name]):
 {item_catalog or "No imported item catalog."}
 Action: {action_description}
@@ -367,12 +390,23 @@ action explicitly and successfully changes it."""
                         damage_bonus = max(-20, min(int(result.get("damage_bonus", 0)), 100))
                     except (TypeError, ValueError):
                         damage_bonus = 0
+                    raw_currency = result.get("currency", {})
+                    currency_delta = {}
+                    for denomination in ("gold", "silver", "copper"):
+                        try:
+                            currency_delta[denomination] = max(
+                                -100000,
+                                min(int(raw_currency.get(denomination, 0)), 100000)
+                            ) if isinstance(raw_currency, dict) else 0
+                        except (TypeError, ValueError):
+                            currency_delta[denomination] = 0
                     return {
                         "narrative": result["narrative"],
                         "loot": valid_loot,
                         "damage": damage,
                         "damage_dice": damage_dice or None,
                         "damage_bonus": damage_bonus,
+                        "currency": currency_delta,
                         "scene_state": str(result.get("scene_state") or scene_state or "")[:2000],
                         "location_changed": bool(result.get("location_changed", False)),
                         "entities": [
@@ -406,7 +440,20 @@ action explicitly and successfully changes it."""
                             if isinstance(memory, dict)
                             and str(memory.get("npc_name", "")).strip()
                             and str(memory.get("fact", "")).strip()
-                        ] if isinstance(result.get("npc_memories", []), list) else []
+                        ] if isinstance(result.get("npc_memories", []), list) else [],
+                        "quest_offers": [
+                            offer for offer in result.get("quest_offers", [])
+                            if isinstance(offer, dict)
+                            and str(offer.get("npc_name", "")).strip()
+                            and str(offer.get("title", "")).strip()
+                            and str(offer.get("description", "")).strip()
+                        ] if isinstance(result.get("quest_offers", []), list) else [],
+                        "quest_completions": [
+                            completion for completion in result.get("quest_completions", [])
+                            if isinstance(completion, dict)
+                            and str(completion.get("npc_name", "")).strip()
+                            and str(completion.get("title", "")).strip()
+                        ] if isinstance(result.get("quest_completions", []), list) else []
                     }
                 except (json.JSONDecodeError, ValueError):
                     # Do not award anything when the model fails to follow JSON format.
@@ -416,6 +463,7 @@ action explicitly and successfully changes it."""
                         "damage": 0,
                         "damage_dice": None,
                         "damage_bonus": 0,
+                        "currency": {"gold": 0, "silver": 0, "copper": 0},
                         "scene_state": scene_state or "",
                         "location_changed": False,
                         "entities": [],
@@ -425,7 +473,9 @@ action explicitly and successfully changes it."""
                         "target_name": None,
                         "enemy_attacks": False,
                         "npcs": [],
-                        "npc_memories": []
+                        "npc_memories": [],
+                        "quest_offers": [],
+                        "quest_completions": []
                     }
 
         except Exception as e:
@@ -436,6 +486,7 @@ action explicitly and successfully changes it."""
                 "damage": 0,
                 "damage_dice": None,
                 "damage_bonus": 0,
+                "currency": {"gold": 0, "silver": 0, "copper": 0},
                 "scene_state": scene_state or "",
                 "location_changed": False,
                 "entities": [],
@@ -445,5 +496,7 @@ action explicitly and successfully changes it."""
                 "target_name": None,
                 "enemy_attacks": False,
                 "npcs": [],
-                "npc_memories": []
+                "npc_memories": [],
+                "quest_offers": [],
+                "quest_completions": []
             }

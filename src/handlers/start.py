@@ -8,9 +8,10 @@ from src.models.base import SessionLocal
 from src.models import (
     User, Character, CharacterAttribute, CharacterAbility, CharacterSpell,
     Inventory, Item, Group, GroupMember,
-    ActionHistory, GameSession, CombatEncounter, CampaignNPC
+    ActionHistory, GameSession, CombatEncounter, CampaignNPC, CharacterCurrency
 )
 from src.services import RulesService, GameEngineService
+from src.services.character_service import xp_for_next_level
 from src.services.open5e_localization import localized_feature_description, localized_item_type
 import logging
 
@@ -74,8 +75,9 @@ async def menu_command(message: types.Message):
 
 
 @router.callback_query(F.data == "main_menu")
-async def main_menu_callback(query: types.CallbackQuery):
+async def main_menu_callback(query: types.CallbackQuery, state: FSMContext):
     """Return to the main game menu."""
+    await state.clear()
     await query.message.edit_text(
         "🎮 <b>Главное меню</b>\n\n"
         "Выберите действие:",
@@ -115,7 +117,10 @@ async def menu_action_callback(query: types.CallbackQuery, state: FSMContext):
 
         await query.message.answer(
             f"⚔️ <b>Действие персонажа {character.name}</b>\n\n"
-            "Опишите, что хотите сделать:"
+            "Опишите, что хотите сделать:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]
+            ])
         )
         from src.handlers.game import ActionStates
         await state.set_state(ActionStates.describing_action)
@@ -130,7 +135,8 @@ async def reset_setting_callback(query: types.CallbackQuery):
         [
             InlineKeyboardButton(text="✅ Да", callback_data="confirm_setting_reset"),
             InlineKeyboardButton(text="❌ Нет", callback_data="cancel_setting_reset"),
-        ]
+        ],
+        [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]
     ])
     await query.message.edit_text(
         "⚠️ <b>Пересобрать сеттинг?</b>\n\n"
@@ -190,7 +196,10 @@ async def confirm_setting_reset_callback(query: types.CallbackQuery, state: FSMC
             "🧹 Персонаж и история приключения удалены.\n\n"
             "В каком стиле создать новый мир? Опишите его своими словами: "
             "например, классическое фэнтези, киберпанк, космическая опера "
-            "или любой другой стиль. ДМ будет придерживаться выбранного стиля."
+            "или любой другой стиль. ДМ будет придерживаться выбранного стиля.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]
+            ])
         )
         await query.answer()
     except Exception:
@@ -281,7 +290,7 @@ async def inventory_menu_callback(query: types.CallbackQuery):
         if not character:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🧙 Создать персонажа", callback_data="create_character")],
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+                [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]
             ])
             await query.message.edit_text(
                 "❌ У вас нет персонажа\n\n"
@@ -368,7 +377,7 @@ async def show_profile_callback(query: types.CallbackQuery):
         if not character:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🧙 Создать персонажа", callback_data="create_character")],
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+                [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]
             ])
             await query.message.edit_text(
                 "❌ У вас нет персонажа\n\n"
@@ -393,6 +402,14 @@ async def show_profile_callback(query: types.CallbackQuery):
         spells = db.query(CharacterSpell).filter(
             CharacterSpell.character_id == character.id
         ).order_by(CharacterSpell.spell_level, CharacterSpell.spell_name).all()
+        purse = db.query(CharacterCurrency).filter(
+            CharacterCurrency.character_id == character.id
+        ).first()
+        if purse is None:
+            purse = CharacterCurrency(character_id=character.id)
+            db.add(purse)
+            db.commit()
+        hp_status = "☠️ Погиб" if character.current_hp <= 0 else "❤️ Здоровье"
 
         profile_text = f"""
 <b>⚔️ {character.name}</b>
@@ -401,11 +418,12 @@ async def show_profile_callback(query: types.CallbackQuery):
 Раса: {character.race}
 Класс: {character.class_}
 Уровень: {character.level}
-Опыт: {character.experience}
+Опыт: {character.experience or 0}{f" / {xp_for_next_level(character.level)}" if xp_for_next_level(character.level) else " (максимум)"}
 
-<b>❤️ Здоровье:</b>
+<b>{hp_status}:</b>
 {character.current_hp}/{character.max_hp} HP
 <b>🛡️ Класс защиты:</b> {armor_class}
+<b>💰 Кошелёк:</b> {purse.gold} зм · {purse.silver} см · {purse.copper} мм
 
 <b>📊 Характеристики:</b>
 <b>STR</b> {attributes.strength} ({(attributes.strength-10)//2:+d})
@@ -440,7 +458,7 @@ async def show_profile_callback(query: types.CallbackQuery):
                 profile_text += f"\n• {spell.spell_name} ({level})"
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+            [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]
         ])
 
         await query.message.edit_text(profile_text, reply_markup=keyboard)

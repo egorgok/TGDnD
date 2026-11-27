@@ -105,7 +105,7 @@ class GameEngineService:
         db.commit()
 
         if character.current_hp <= 0:
-            return False, f"{character.name} has been knocked unconscious! HP: {old_hp} → 0"
+            return False, f"{character.name} has died! HP: {old_hp} → 0"
         else:
             return True, f"{character.name} takes {damage_amount} damage! HP: {old_hp} → {character.current_hp}"
 

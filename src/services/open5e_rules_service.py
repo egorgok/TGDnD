@@ -423,6 +423,43 @@ def grant_starting_class_data(db: Session, character) -> dict[str, int]:
     return {"features": feature_count, "items": item_count, "spells": spell_count}
 
 
+def grant_class_features_for_levels(db: Session, character, levels: list[int]) -> list[str]:
+    """Persist official SRD class features unlocked at the specified levels."""
+    class_record = _class_record(db, character.class_)
+    if not class_record:
+        return []
+
+    granted = []
+    for feature in class_record.get("features", []):
+        if not isinstance(feature, dict) or feature.get("feature_type") == "STARTING_EQUIPMENT":
+            continue
+        if not any(
+            isinstance(gained, dict) and gained.get("level") in levels
+            for gained in feature.get("gained_at", [])
+        ):
+            continue
+        english_name = str(feature.get("name") or "").strip()
+        if not english_name:
+            continue
+        display_name = localized_feature_name(english_name)
+        if db.query(CharacterAbility.id).filter(
+            CharacterAbility.character_id == character.id,
+            CharacterAbility.ability_name == display_name
+        ).first():
+            continue
+        db.add(CharacterAbility(
+            character_id=character.id,
+            ability_name=display_name,
+            ability_description=localized_feature_description(
+                english_name,
+                str(feature.get("desc") or "Особенность класса по SRD D&D 5e.")
+            ),
+            is_class=True
+        ))
+        granted.append(display_name)
+    return granted
+
+
 def build_dm_rules_context(db: Session, character, action: str) -> str:
     """Build a compact, sourced rules excerpt for this character's current action."""
     lines: list[str] = []

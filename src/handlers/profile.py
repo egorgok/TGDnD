@@ -5,11 +5,12 @@ from sqlalchemy.orm import Session
 from src.models.base import SessionLocal
 from src.models import (
     Character, CharacterAttribute, CharacterAbility, CharacterSpell,
-    Inventory, Item, GroupMember
+    Inventory, Item, GroupMember, CharacterCurrency
 )
 from src.services import CharacterService
 from src.services import GameEngineService
 from src.services.open5e_localization import localized_feature_description
+from src.services.character_service import xp_for_next_level
 from src.utils import format_error
 import logging
 
@@ -76,6 +77,14 @@ async def profile_command(message: types.Message):
         spells = db.query(CharacterSpell).filter(
             CharacterSpell.character_id == character.id
         ).order_by(CharacterSpell.spell_level, CharacterSpell.spell_name).all()
+        purse = db.query(CharacterCurrency).filter(
+            CharacterCurrency.character_id == character.id
+        ).first()
+        if purse is None:
+            purse = CharacterCurrency(character_id=character.id)
+            db.add(purse)
+            db.commit()
+        xp_target = xp_for_next_level(character.level)
 
         # Format profile
         profile_text = f"""
@@ -85,11 +94,12 @@ async def profile_command(message: types.Message):
 Раса: {character.race}
 Класс: {character.class_}
 Уровень: {character.level}
-Опыт: {character.experience}
+Опыт: {character.experience or 0}{f" / {xp_target}" if xp_target else " (максимум)"}
 
 <b>❤️ Здоровье:</b>
 {character.current_hp}/{character.max_hp} HP
 <b>🛡️ Класс защиты:</b> {armor_class}
+<b>💰 Кошелёк:</b> {purse.gold} зм · {purse.silver} см · {purse.copper} мм
 
 <b>📊 Характеристики:</b>
 <b>STR</b> {attributes.strength} ({(attributes.strength-10)//2:+d})

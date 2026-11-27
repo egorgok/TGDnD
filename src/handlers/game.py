@@ -8,7 +8,7 @@ from src.models.base import SessionLocal
 from src.models import (
     Character, CharacterAttribute, CharacterSpell, Inventory, Item, ActionHistory, GameSession,
     Location, LocationConnection, CombatEncounter, CombatParticipant, GameEntity,
-    CampaignNPC, NPCMemory, DnDRules
+    CampaignNPC, NPCMemory, DnDRules, CharacterCurrency, CampaignQuest
 )
 from src.services import (
     AIService, GameEngineService, CharacterService, InventoryService,
@@ -19,6 +19,7 @@ from src.services.open5e_rules_service import (
     localize_catalog_item
 )
 from src.services.open5e_localization import canonical_item_name, localized_item_type
+from src.services.character_service import add_experience, XP_THRESHOLDS
 from src.utils import format_error
 import logging
 import base64
@@ -26,11 +27,49 @@ import httpx
 import re
 import json
 import html
+from datetime import datetime
 from typing import Optional
 from io import BytesIO
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+XP_BY_CR = {
+    "0": 10, "1/8": 25, "1/4": 50, "1/2": 100,
+    **{str(cr): xp for cr, xp in enumerate(
+        [200, 450, 700, 1100, 1800, 2300, 2900, 3900, 5000, 5900,
+         7200, 8400, 10000, 11500, 13000, 15000, 18000, 20000, 22000,
+         25000, 33000, 41000, 50000, 62000, 75000, 90000, 105000,
+         120000, 135000, 155000],
+        start=1
+    )}
+}
+
+
+def _entity_xp_reward(db: Session, entity: GameEntity, character_level: int) -> int:
+    """Use official monster CR XP where available; modest fallback for homebrew foes."""
+    normalized_name = _normalize_entity_name(entity.name)
+    for (record,) in db.query(DnDRules.rule_data).filter(
+        DnDRules.rule_category == "open5e_creatures"
+    ).all():
+        if not isinstance(record, dict):
+            continue
+        official_name = _normalize_entity_name(str(record.get("name") or ""))
+        if official_name != normalized_name:
+            continue
+        cr = record.get("challenge_rating", record.get("cr", ""))
+        if isinstance(cr, dict):
+            cr = cr.get("value") or cr.get("name") or ""
+        xp = record.get("xp") or record.get("experience_points")
+        try:
+            if xp:
+                return max(0, int(xp))
+        except (TypeError, ValueError):
+            pass
+        cr_key = str(cr).strip().removesuffix(".0")
+        if cr_key in XP_BY_CR:
+            return XP_BY_CR[cr_key]
+    return max(25, character_level * 25)
 
 
 async def _send_generated_image(send_photo, prompt: str, caption: str) -> bool:
@@ -459,6 +498,15 @@ async def inspect_entity_command(message: types.Message):
             memories = db.query(NPCMemory).filter(
                 NPCMemory.npc_id == npc.id
             ).order_by(NPCMemory.created_at.asc()).all()
+            quests = db.query(CampaignQuest).filter(
+                CampaignQuest.npc_id == npc.id
+            ).order_by(CampaignQuest.created_at.asc()).all()
+            quest_text = "\n".join(
+                f"• {html.escape(quest.title)} — "
+                f"{'выполнено' if quest.status == 'completed' else 'активно'} "
+                f"({quest.reward_xp} XP)\n  {html.escape(quest.description)}"
+                for quest in quests
+            )
             status = "жив" if npc.is_alive else "погиб"
             visibility = "враждебен" if npc.is_hostile else "не враждебен"
             combat_stats = (
@@ -475,6 +523,7 @@ async def inspect_entity_command(message: types.Message):
                 f"<b>Последнее известное место:</b> "
                 f"{html.escape(npc.current_location or 'Неизвестно')}\n\n"
                 f"Состояние: {status}, {visibility}{combat_stats}\n\n"
+                f"<b>Задания:</b>\n{quest_text or 'Пока нет известных заданий.'}\n\n"
                 f"<b>Что вы о нём знаете:</b>\n{memory_text or 'Пока никаких особых фактов.'}"
             )
         elif npcs:
@@ -489,8 +538,13 @@ async def inspect_entity_command(message: types.Message):
                     if entity and entity.is_alive
                     else "погиб" if not npc.is_alive else "статус неизвестен"
                 )
+                has_quest = db.query(CampaignQuest.id).filter(
+                    CampaignQuest.npc_id == npc.id,
+                    CampaignQuest.status == "offered"
+                ).first()
                 lines.append(
-                    f"• {html.escape(npc.name)} — {html.escape(npc.role or 'NPC')}, {status}"
+                    f"• {html.escape(npc.name)} — {html.escape(npc.role or 'NPC')}, "
+                    f"{status}{', есть задание' if has_quest else ''}"
                 )
             lines.append("\nПодробнее: <code>/inspect имя</code>")
             await message.answer("\n".join(lines))
@@ -565,6 +619,10 @@ async def action_command(message: types.Message, state: FSMContext):
                 "Создайте персонажа командой /create_character"
             )
             return
+        if character.current_hp <= 0:
+            await message.answer(f"☠️ {character.name} погиб и больше не может действовать.")
+            await state.clear()
+            return
 
         await message.answer(
             f"⚔️ <b>Действие персонажа {character.name}</b>\n\n"
@@ -597,6 +655,13 @@ async def handle_action_description(message: types.Message, state: FSMContext):
 
         if not character:
             await message.answer(format_error("Персонаж не найден"))
+            await state.clear()
+            return
+        if character.current_hp <= 0:
+            await message.answer(
+                f"☠️ <b>{character.name} погиб.</b>\n"
+                "При 0 HP персонаж больше не может совершать действия."
+            )
             await state.clear()
             return
 
@@ -740,13 +805,33 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 "current_location": npc.current_location,
                 "hostile": npc.is_hostile,
                 "alive": npc.is_alive,
-                "memories": [memory.fact for memory in memories]
+                "memories": [memory.fact for memory in memories],
+                "quests": [
+                    {
+                        "title": quest.title,
+                        "description": quest.description,
+                        "reward_xp": quest.reward_xp,
+                        "status": quest.status
+                    }
+                    for quest in db.query(CampaignQuest).filter(
+                        CampaignQuest.npc_id == npc.id
+                    ).order_by(CampaignQuest.created_at.asc()).all()
+                ]
             })
+        active_quest_ids_at_start = [
+            quest_id for (quest_id,) in db.query(CampaignQuest.id).filter(
+                CampaignQuest.character_id == character.id,
+                CampaignQuest.status == "offered"
+            ).all()
+        ]
 
         # Show "thinking" message
         thinking_msg = await message.answer("🤔 ДМ думает...")
 
         try:
+            purse = db.query(CharacterCurrency).filter(
+                CharacterCurrency.character_id == character.id
+            ).first()
             # Roll before the DM adjudicates the action so the result can affect
             # the narrative and consequences.
             d20_roll = GameEngineService.roll_d20()
@@ -768,7 +853,12 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     row["item"].name
                     for row in InventoryService.get_inventory(db, character.id)
                     if row.get("item")
-                ]
+                ],
+                currency={
+                    "gold": purse.gold,
+                    "silver": purse.silver,
+                    "copper": purse.copper
+                } if purse else {"gold": 0, "silver": 0, "copper": 0}
             )
             if arena_opponent and isinstance(ai_result, dict):
                 ai_result["target_name"] = arena_opponent.name
@@ -776,6 +866,8 @@ async def handle_action_description(message: types.Message, state: FSMContext):
 
             # Save AI-awarded loot silently; its narrative is shown as usual.
             narrative = ai_result.get("narrative", "") if isinstance(ai_result, dict) else str(ai_result)
+            xp_earned = 0
+            quest_messages = []
             new_hostile_arrived = bool(
                 isinstance(ai_result, dict)
                 and any(
@@ -940,6 +1032,71 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                             source=str(memory_data.get("source") or "игровая сцена")[:255]
                         ))
                 db.flush()
+
+                for offer in ai_result.get("quest_offers", []):
+                    npc_name = str(offer.get("npc_name") or "").strip()[:255]
+                    title = str(offer.get("title") or "").strip()[:255]
+                    description = str(offer.get("description") or "").strip()[:2000]
+                    if not npc_name or not title or not description:
+                        continue
+                    npc = db.query(CampaignNPC).filter(
+                        CampaignNPC.group_id == character.group_id,
+                        CampaignNPC.name.ilike(npc_name),
+                        CampaignNPC.is_hostile.is_(False),
+                        CampaignNPC.is_alive.is_(True)
+                    ).first()
+                    if not npc:
+                        continue
+                    prior_quest = db.query(CampaignQuest.id).filter(
+                        CampaignQuest.npc_id == npc.id
+                    ).first()
+                    if prior_quest:
+                        continue
+                    reward_xp = _safe_int(offer.get("reward_xp"), 100, 25, 5000)
+                    db.add(CampaignQuest(
+                        group_id=character.group_id,
+                        character_id=character.id,
+                        npc_id=npc.id,
+                        title=title,
+                        description=description,
+                        reward_xp=reward_xp,
+                        status="offered"
+                    ))
+                    quest_messages.append(
+                        f"📜 <b>Задание от {html.escape(npc.name)}: "
+                        f"{html.escape(title)}</b>\n"
+                        f"{html.escape(description)}\nНаграда: {reward_xp} XP."
+                    )
+
+                db.flush()
+                for completion in ai_result.get("quest_completions", []):
+                    if not active_quest_ids_at_start:
+                        continue
+                    npc_name = str(completion.get("npc_name") or "").strip()[:255]
+                    title = str(completion.get("title") or "").strip()[:255]
+                    if not npc_name or not title:
+                        continue
+                    quest = db.query(CampaignQuest).join(
+                        CampaignNPC, CampaignNPC.id == CampaignQuest.npc_id
+                    ).filter(
+                        CampaignQuest.group_id == character.group_id,
+                        CampaignQuest.character_id == character.id,
+                        CampaignQuest.id.in_(active_quest_ids_at_start),
+                        CampaignQuest.status == "offered",
+                        CampaignNPC.name.ilike(npc_name),
+                        CampaignQuest.title.ilike(title)
+                    ).first()
+                    if not quest:
+                        continue
+                    quest.status = "completed"
+                    quest.completed_at = datetime.utcnow()
+                    xp_earned += quest.reward_xp
+                    quest_messages.append(
+                        f"✅ Задание «{html.escape(quest.title)}» выполнено. "
+                        f"Получено {quest.reward_xp} XP."
+                    )
+                if quest_messages:
+                    narrative += "\n\n" + "\n\n".join(quest_messages)
 
             homebrew_spell_warning = ""
             newly_added_improvised_weapons = []
@@ -1202,6 +1359,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         target.current_hp = max(0, target.current_hp - damage)
                         if target.current_hp == 0:
                             target.is_alive = False
+                            xp_earned += _entity_xp_reward(db, target, character.level)
                             npc_record = db.query(CampaignNPC).filter(
                                 CampaignNPC.group_id == character.group_id,
                                 CampaignNPC.name.ilike(target.name)
@@ -1281,10 +1439,15 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         f"Здоровье: {character.current_hp}/{character.max_hp}."
                     )
                 if not alive:
-                    damage_text += "\n😵 Персонаж без сознания."
+                    damage_text += "\n☠️ Персонаж погиб. Дальнейшие действия невозможны."
 
             enemy_attack_text = ""
-            if isinstance(ai_result, dict) and ai_result.get("enemy_attacks") and target and target.is_hostile and target.is_alive:
+            if (
+                character.current_hp > 0
+                and isinstance(ai_result, dict)
+                and ai_result.get("enemy_attacks")
+                and target and target.is_hostile and target.is_alive
+            ):
                 attributes = db.query(CharacterAttribute).filter(
                     CharacterAttribute.character_id == character.id
                 ).first()
@@ -1324,6 +1487,26 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         ).first()
                     )
 
+            progression_note = ""
+            if xp_earned > 0:
+                granted_xp, reached_levels, unlocked_features = add_experience(
+                    db, character, xp_earned
+                )
+                progression_note = (
+                    f"\n\n✨ Получено опыта: {granted_xp} XP "
+                    f"(всего {character.experience}; "
+                    f"до следующего уровня: "
+                    f"{max(0, XP_THRESHOLDS.get(character.level + 1, character.experience) - character.experience)} XP)."
+                )
+                if reached_levels:
+                    progression_note += (
+                        f"\n🎉 Новый уровень: {character.level}! "
+                        f"Максимум HP: {character.max_hp}."
+                    )
+                    if unlocked_features:
+                        progression_note += "\nОткрыты особенности: " + ", ".join(unlocked_features) + "."
+                narrative += progression_note
+
             new_scene_state = ai_result.get("scene_state", "") if isinstance(ai_result, dict) else ""
 
             history_entry = ActionHistory(
@@ -1349,6 +1532,35 @@ async def handle_action_description(message: types.Message, state: FSMContext):
 
             roll_text = f"🎲 <b>Результат броска:</b> {d20_roll}\n\n"
 
+            currency_note = ""
+            currency_delta = ai_result.get("currency", {}) if isinstance(ai_result, dict) else {}
+            if isinstance(currency_delta, dict):
+                deltas = {
+                    coin: _safe_int(currency_delta.get(coin), 0, -100000, 100000)
+                    for coin in ("gold", "silver", "copper")
+                }
+                if any(deltas.values()):
+                    purse = db.query(CharacterCurrency).filter(
+                        CharacterCurrency.character_id == character.id
+                    ).first()
+                    if purse is None:
+                        purse = CharacterCurrency(character_id=character.id)
+                        db.add(purse)
+                        db.flush()
+                    # D&D exchange rates: 10 copper = 1 silver; 10 silver = 1 gold.
+                    total_copper = max(
+                        0,
+                        (purse.gold or 0) * 100 + (purse.silver or 0) * 10 + (purse.copper or 0)
+                        + deltas["gold"] * 100 + deltas["silver"] * 10 + deltas["copper"]
+                    )
+                    purse.gold, remainder = divmod(total_copper, 100)
+                    purse.silver, purse.copper = divmod(remainder, 10)
+                    currency_note = (
+                        f"\n\n💰 Кошелёк: {purse.gold} зм, "
+                        f"{purse.silver} см, {purse.copper} мм."
+                    )
+                    db.commit()
+
             result_text = f"""
 ⚔️ <b>{character.name}</b> выполняет действие
 
@@ -1356,13 +1568,19 @@ async def handle_action_description(message: types.Message, state: FSMContext):
 
 {roll_text}
 <b>Результат:</b>
-{narrative}{damage_text}{enemy_attack_text}
+{narrative}{damage_text}{enemy_attack_text}{currency_note}
 """
 
             await thinking_msg.delete()
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➡️ Дальше", callback_data="continue_action")]
+            action_buttons = []
+            if character.current_hp > 0:
+                action_buttons.append([
+                    InlineKeyboardButton(text="➡️ Дальше", callback_data="continue_action")
+                ])
+            action_buttons.append([
+                InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")
             ])
+            keyboard = InlineKeyboardMarkup(inline_keyboard=action_buttons)
             await message.answer(result_text, reply_markup=keyboard)
             if scene_image_kind:
                 image_prompt = (
@@ -1379,7 +1597,15 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     "look": "🔎 Вид вокруг",
                 }[scene_image_kind]
                 await _send_generated_image(message.answer_photo, image_prompt, caption)
-            if active_encounter and active_encounter.is_active:
+            if character.current_hp <= 0:
+                if active_encounter:
+                    active_encounter.is_active = False
+                if active_game_session:
+                    active_game_session.combat_active = False
+                    active_game_session.turn_order = None
+                db.commit()
+                await state.clear()
+            elif active_encounter and active_encounter.is_active:
                 await state.set_state(CombatStates.in_combat)
                 await state.update_data(
                     encounter_id=active_encounter.id,
@@ -1413,6 +1639,11 @@ async def continue_action_callback(query: types.CallbackQuery, state: FSMContext
         ).first()
         if not character:
             await query.answer("Персонаж не найден", show_alert=True)
+            return
+        if character.current_hp <= 0:
+            await query.message.answer(f"☠️ {character.name} погиб и больше не может действовать.")
+            await state.clear()
+            await query.answer()
             return
 
         await query.message.answer(
@@ -1623,6 +1854,15 @@ async def attack_in_combat_callback(query: types.CallbackQuery, state: FSMContex
         character = db.query(Character).filter(
             Character.id == character_id
         ).first()
+        if not encounter or not character:
+            await query.answer("Бой или персонаж больше не доступны.", show_alert=True)
+            await state.clear()
+            return
+        if character.current_hp <= 0:
+            CombatService.end_combat(db, encounter_id)
+            await state.clear()
+            await query.answer("Персонаж погиб и больше не может действовать.", show_alert=True)
+            return
 
         attributes = db.query(CharacterAttribute).filter(
             CharacterAttribute.character_id == character_id
