@@ -9,6 +9,7 @@ from src.models import (
     CharacterAbility, CharacterSpell, DnDRules, Inventory, Item
 )
 from src.services.open5e_localization import (
+    canonical_item_name,
     canonical_spell_name,
     localized_feature_description,
     localized_feature_name,
@@ -611,3 +612,27 @@ def build_item_catalog(db: Session) -> str:
             seen.add(key)
             records.append(f"{russian_name} [{english_name}]")
     return "; ".join(sorted(records, key=str.casefold))[:8000]
+
+
+def is_open5e_catalog_item(db: Session, item: Item) -> bool:
+    """True only for equipment whose mechanics originate in imported API records."""
+    if not item:
+        return False
+    item_names = {
+        canonical_item_name(item.name).casefold(),
+        str(item.name or "").casefold()
+    }
+    for category in ("open5e_weapons", "open5e_armor", "open5e_items"):
+        for (record,) in db.query(DnDRules.rule_data).filter(
+            DnDRules.rule_category == category
+        ).all():
+            if not isinstance(record, dict):
+                continue
+            official_name = str(record.get("name") or "").strip()
+            if not official_name:
+                continue
+            if official_name.casefold() in item_names:
+                return True
+            if localized_item_name(official_name).casefold() in item_names:
+                return True
+    return False
