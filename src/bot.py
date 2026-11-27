@@ -28,6 +28,20 @@ class DnDBot:
         """Initialize database tables"""
         try:
             Base.metadata.create_all(engine)
+            with engine.begin() as conn:
+                for column, col_type in (
+                    ("reward_gold", "INTEGER NOT NULL DEFAULT 0"),
+                    ("reward_silver", "INTEGER NOT NULL DEFAULT 0"),
+                    ("reward_copper", "INTEGER NOT NULL DEFAULT 0"),
+                    ("reward_items_json", "TEXT"),
+                    ("reward_spells_json", "TEXT"),
+                ):
+                    try:
+                        conn.exec_driver_sql(
+                            f"ALTER TABLE campaign_quests ADD COLUMN {column} {col_type}"
+                        )
+                    except Exception:
+                        pass
             logger.info("Database tables created successfully")
         except Exception as e:
             logger.error(f"Error initializing database: {e}")

@@ -34,6 +34,144 @@ from io import BytesIO
 logger = logging.getLogger(__name__)
 router = Router()
 
+
+def _quest_reward_text(quest: CampaignQuest) -> str:
+    rewards = [f"{int(quest.reward_xp or 0)} XP"]
+    coins = []
+    for field, label in (
+        ("reward_gold", "зм"), ("reward_silver", "см"), ("reward_copper", "мм")
+    ):
+        amount = int(getattr(quest, field, 0) or 0)
+        if amount:
+            coins.append(f"{amount} {label}")
+    if coins:
+        rewards.append(", ".join(coins))
+    items = getattr(quest, "reward_items", []) or []
+    if items:
+        item_parts = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            name = str(it.get("name") or "").strip()
+            if not name:
+                continue
+            qty = _safe_int(it.get("quantity"), 1, 1, 99)
+            item_parts.append(f"{name} x{qty}" if qty != 1 else name)
+        if item_parts:
+            rewards.append(", ".join(item_parts[:4]))
+    spells = getattr(quest, "reward_spells", []) or []
+    if spells:
+        spell_parts = [str(s.get("name","")).strip() for s in spells if isinstance(s, dict) and str(s.get("name","")).strip()]
+        if spell_parts:
+            rewards.append("заклинания: " + ", ".join(spell_parts[:3]))
+    return " + ".join(rewards)
+
+
+def _grant_item_to_character(db: Session, character: Character, item_name: str, quantity: int = 1, description: str | None = None) -> tuple[Item, int]:
+    quantity = max(1, min(int(quantity or 1), 99))
+    canonical_name = canonical_item_name(item_name)
+    source_item = db.query(Item).filter(Item.name.ilike(canonical_name)).first()
+    if source_item is None:
+        source_item = Item(
+            name=canonical_name[:255],
+            item_type="gear",
+            description=(description or "")[:1000] or None,
+            damage_dice=None,
+            damage_type=None,
+            armor_class=None,
+            is_stackable=False,
+        )
+        db.add(source_item)
+        db.flush()
+    inv = db.query(Inventory).filter(
+        Inventory.character_id == character.id,
+        Inventory.item_id == source_item.id
+    ).first()
+    if inv:
+        inv.quantity = max(1, (inv.quantity or 0) + quantity)
+    else:
+        is_armor = source_item.item_type.startswith("armor:") or source_item.item_type == "shield"
+        is_weapon = source_item.item_type.startswith("weapon:")
+        inv = Inventory(
+            character_id=character.id,
+            item_id=source_item.id,
+            quantity=quantity,
+            is_equipped=is_armor or is_weapon,
+            slot="armor" if is_armor else "weapon" if is_weapon else None,
+        )
+        db.add(inv)
+    db.flush()
+    return source_item, quantity
+
+
+def _apply_equipment_action(db: Session, character: Character, action: str) -> Optional[str]:
+    """Apply explicit put-away/take-in-hand actions to the authoritative inventory."""
+    text = action.casefold()
+    inventory = InventoryService.get_inventory(db, character.id)
+    if not inventory:
+        return None
+    commands = []
+    put_match = re.search(
+        r"(?:убрал|убираю|положил|кладу|поместил|помещаю)\s+(.+?)(?:\s+в\s+(?:рюкзак|сумку))?(?:\s+и\s+|[,.;]|$)",
+        text
+    )
+    take_match = re.search(
+        r"(?:взял|беру|возьму|взять|держу|экипир\w*)\s+(?:в\s+руки\s+)?(.+?)(?:\s+в\s+руки)?(?:\s+и\s+|[,.;]|$)",
+        text
+    )
+    if put_match:
+        commands.append((False, put_match.group(1)))
+    if take_match:
+        commands.append((True, take_match.group(1)))
+    if not commands:
+        return None
+    applied = []
+    for take_item, raw_requested in commands:
+        requested = re.sub(r"[\"'«»]", "", raw_requested).strip()
+        candidates = [
+            row for row in inventory
+            if row.get("item") and (
+                requested in row["item"].name.casefold()
+                or row["item"].name.casefold() in requested
+            )
+        ]
+        if not candidates:
+            continue
+        selected = candidates[0]["item"]
+        rows = db.query(Inventory).filter(
+            Inventory.character_id == character.id,
+            Inventory.item_id == selected.id
+        ).all()
+        if not take_item:
+            for row in rows:
+                row.is_equipped = False
+            applied.append(f"• {selected.name} убран")
+            continue
+        item_type = (selected.item_type or "").casefold()
+        slot = "armor" if item_type.startswith("armor:") or item_type == "shield" else (
+            "weapon" if item_type.startswith("weapon:") else "hands"
+        )
+        for row in db.query(Inventory).filter(
+            Inventory.character_id == character.id,
+            Inventory.slot == slot
+        ).all():
+            row.is_equipped = False
+        for row in rows:
+            row.is_equipped = True
+            row.slot = slot
+        applied.append(f"✓ {selected.name} экипирован")
+    return ", ".join(applied) if applied else None
+
+
+def _is_inventory_position_phrase(name: str) -> bool:
+    """Reject AI-created pseudo-items such as «в руки факел»."""
+    normalized = re.sub(r"[\"'«»]", "", (name or "").casefold()).strip()
+    return bool(re.match(
+        r"^(?:в\s+руки|в\s+рюкзак|в\s+сумку|в\s+карман|надел(?:а)?|экипировал(?:а)?)\s+",
+        normalized
+    ))
+
+
 XP_BY_CR = {
     "0": 10, "1/8": 25, "1/4": 50, "1/2": 100,
     **{str(cr): xp for cr, xp in enumerate(
@@ -386,6 +524,8 @@ def _loot_from_explicit_action(action_description: str) -> list[dict]:
     name = re.split(r"\s+(?:и|чтобы|для|в|на|с)\s+|[,.;!?]", match.group(1))[0].strip()
     if len(name) < 2:
         return []
+    if _is_inventory_position_phrase(name):
+        return []
     return [{"name": name.capitalize(), "type": "предмет", "quantity": 1}]
 
 
@@ -596,7 +736,7 @@ def _roll_entity_damage_detail(dice: str, critical: bool = False) -> tuple[int, 
 
 def _sanitize_custom_item(raw_item: dict) -> Optional[dict]:
     name = str(raw_item.get("name") or "").strip()[:255]
-    if not name:
+    if not name or _is_inventory_position_phrase(name):
         return None
 
     raw_type = str(raw_item.get("item_type") or "gear").casefold()
@@ -834,7 +974,7 @@ async def inspect_entity_command(message: types.Message):
             quest_text = "\n".join(
                 f"• {html.escape(quest.title)} — "
                 f"{'выполнено' if quest.status == 'completed' else 'активно'} "
-                f"({quest.reward_xp} XP)\n  {html.escape(quest.description)}"
+                f"({_quest_reward_text(quest)})\n  {html.escape(quest.description)}"
                 for quest in quests
             )
             status = "жив" if npc.is_alive else "погиб"
@@ -1159,6 +1299,10 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         "title": quest.title,
                         "description": quest.description,
                         "reward_xp": quest.reward_xp,
+                        "reward_gold": quest.reward_gold,
+                        "reward_silver": quest.reward_silver,
+                        "reward_copper": quest.reward_copper,
+                        "reward_items": quest.reward_items,
                         "status": quest.status
                     }
                     for quest in db.query(CampaignQuest).filter(
@@ -1271,6 +1415,13 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     Inventory.character_id == character.id,
                     Inventory.item_id == item_id
                 ).order_by(Inventory.id).all()
+                if not rows:
+                    continue
+                item_obj = db.query(Item).filter(Item.id == item_id).first()
+                if item_obj and _is_inventory_position_phrase(item_obj.name):
+                    for row in rows:
+                        db.delete(row)
+                    continue
                 if len(rows) > 1:
                     canonical_row = rows[0]
                     canonical_row.quantity = sum(max(0, row.quantity or 0) for row in rows)
@@ -1295,6 +1446,13 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 )
                 await state.clear()
                 return
+
+            equipment_note = _apply_equipment_action(db, character, action_description)
+            if equipment_note:
+                db.commit()
+                narrative_preview = ai_result.get("narrative", "") if isinstance(ai_result, dict) else ""
+                if isinstance(ai_result, dict):
+                    ai_result["narrative"] = f"{narrative_preview}\n\n{equipment_note}"
 
             active_game_session = db.query(GameSession).filter(
                 GameSession.group_id == character.group_id
@@ -1523,6 +1681,23 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     if prior_quest:
                         continue
                     reward_xp = _safe_int(offer.get("reward_xp"), 100, 25, 5000)
+                    reward_gold = _safe_int(offer.get("reward_gold"), 0, 0, 100000)
+                    reward_silver = _safe_int(offer.get("reward_silver"), 0, 0, 100000)
+                    reward_copper = _safe_int(offer.get("reward_copper"), 0, 0, 100000)
+                    reward_items = [
+                        {
+                            "name": str(item.get("name")).strip()[:255],
+                            "quantity": _safe_int(item.get("quantity"), 1, 1, 99),
+                            "description": str(item.get("description") or "")[:1000],
+                        }
+                        for item in offer.get("reward_items", [])
+                        if isinstance(item, dict) and str(item.get("name") or "").strip()
+                    ][:10]
+                    reward_spells = [
+                        {"name": str(sp.get("name")).strip()[:255], "level": _safe_int(sp.get("level"), 1, 0, 9)}
+                        for sp in offer.get("reward_spells", [])
+                        if isinstance(sp, dict) and str(sp.get("name") or "").strip()
+                    ][:5]
                     db.add(CampaignQuest(
                         group_id=character.group_id,
                         character_id=character.id,
@@ -1530,12 +1705,24 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         title=title,
                         description=description,
                         reward_xp=reward_xp,
+                        reward_gold=reward_gold,
+                        reward_silver=reward_silver,
+                        reward_copper=reward_copper,
+                        reward_items=reward_items,
+                        reward_spells=reward_spells,
                         status="offered"
                     ))
                     quest_messages.append(
                         f"📜 <b>Задание от {html.escape(npc.name)}: "
                         f"{html.escape(title)}</b>\n"
-                        f"{html.escape(description)}\nНаграда: {reward_xp} XP."
+                        f"{html.escape(description)}\nНаграда: "
+                        f"{reward_xp} XP"
+                        + (f", {reward_gold} зм" if reward_gold else "")
+                        + (f", {reward_silver} см" if reward_silver else "")
+                        + (f", {reward_copper} мм" if reward_copper else "")
+                        + (f", предметы: {', '.join(str(i['name']) for i in reward_items)}" if reward_items else "")
+                        + (f", заклинания: {', '.join(str(i['name']) for i in reward_spells)}" if reward_spells else "")
+                        + "."
                     )
 
                 db.flush()
@@ -1561,9 +1748,53 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     quest.status = "completed"
                     quest.completed_at = datetime.utcnow()
                     xp_earned += quest.reward_xp
+                    reward_copper_total = (
+                        (quest.reward_gold or 0) * 100
+                        + (quest.reward_silver or 0) * 10
+                        + (quest.reward_copper or 0)
+                    )
+                    if reward_copper_total:
+                        purse = db.query(CharacterCurrency).filter(
+                            CharacterCurrency.character_id == character.id
+                        ).first()
+                        if purse is None:
+                            purse = CharacterCurrency(character_id=character.id)
+                            db.add(purse)
+                        total = (
+                            (purse.gold or 0) * 100
+                            + (purse.silver or 0) * 10
+                            + (purse.copper or 0)
+                            + reward_copper_total
+                        )
+                        purse.gold, remainder = divmod(total, 100)
+                        purse.silver, purse.copper = divmod(remainder, 10)
+                    for reward_item in quest.reward_items:
+                        _grant_item_to_character(
+                            db,
+                            character,
+                            reward_item.get("name"),
+                            reward_item.get("quantity", 1),
+                            reward_item.get("description"),
+                        )
+                    for reward_spell in getattr(quest, "reward_spells", []) or []:
+                        spell_name = str(reward_spell.get("name") or "").strip()[:255]
+                        if not spell_name:
+                            continue
+                        exists = db.query(CharacterSpell.id).filter(
+                            CharacterSpell.character_id == character.id,
+                            CharacterSpell.spell_name.ilike(spell_name)
+                        ).first()
+                        if not exists:
+                            db.add(CharacterSpell(
+                                character_id=character.id,
+                                spell_name=spell_name,
+                                spell_level=_safe_int(reward_spell.get("level"), 1, 0, 9),
+                                slots_available=1,
+                                slots_used=0,
+                            ))
                     quest_messages.append(
                         f"✅ Задание «{html.escape(quest.title)}» выполнено. "
-                        f"Получено {quest.reward_xp} XP."
+                        f"Получено {_quest_reward_text(quest)}."
                     )
                 if quest_messages:
                     narrative += "\n\n" + "\n\n".join(quest_messages)
@@ -1929,7 +2160,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 if not isinstance(found, dict):
                     continue
                 name = str(found.get("name", "")).strip()[:255]
-                if not name:
+                if not name or _is_inventory_position_phrase(name):
                     continue
                 try:
                     quantity = max(0, min(int(found.get("quantity", 1)), 1000))
@@ -2849,7 +3080,9 @@ async def help_command(message: types.Message):
 <b>📋 Персонаж:</b>
 /create_character - Создать нового персонажа
 /profile - Показать профиль персонажа
-/inventory - Управлять инвентарём
+/inventory - Показать инвентарь
+/equip <номер> - Экипировать предмет (по номеру из /inventory)
+/unequip <номер> - Снять предмет (по номеру из /inventory)
 /inspect [имя] - Осмотреть встреченного человека или существо
 
 <b>🎮 Игра:</b>

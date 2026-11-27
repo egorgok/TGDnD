@@ -344,11 +344,15 @@ and "enemy_attacks" (true only when a present hostile creature actually attacks 
 and "npcs" (new or revisited NPC records with name, aliases, role, description,
 personality, current_location, is_hostile, is_alive) and "npc_memories" (new factual
 memories, each with npc_name, fact, source), "quest_offers" (npc_name, title,
-description, reward_xp), and "quest_completions" (npc_name, title).
+description, reward_xp, optional reward_gold/reward_silver/reward_copper, optional
+reward_items/reward_spells), and "quest_completions" (npc_name, title).
 Put items in loot ONLY when the character actually finds/receives them in this action.
 If your narrative says the character picks an item up, takes it, keeps it, or puts it
 in a bag/pocket, that item MUST be included in loot using its exact name.
 The d20 result is authoritative: 1 is a disastrous failure, 20 is an exceptional success.
+Do not create custom_items for merely holding/equipping an item the character already has.
+If an item is already in inventory and the action is "take in hand/put in backpack",
+never emit a pseudo-item name containing location/position words like "в руки факел".
 For a luck check, 1 means catastrophic outcome and 20 means exceptionally lucky outcome
 with minimal or no harm; scale consequences between them.
 When check_result is supplied, it is the authoritative total and check category; adjudicate
@@ -408,8 +412,10 @@ incapable of offering one. Check known NPC quest history first and never repeat 
 already recorded. Keep quests concrete, achievable, and tied to the NPC and setting.
 Offer reasonable XP (usually 50-300 for a modest local task, more only for a genuinely
 dangerous major objective), include it in quest_offers, and mention the offer in the
-narrative. Return quest_completions only when the action clearly fulfills a recorded
-active quest; never award XP for merely accepting or discussing it.
+narrative. You may also include small quest rewards in coins (reward_gold/reward_silver/
+reward_copper) and/or items (reward_items: list of dicts with name, quantity, optional
+description) when appropriate. Return quest_completions only when the action clearly fulfills a recorded
+active quest; never award XP or rewards for merely accepting or discussing it.
 When reporting quest_completions, copy the exact stored NPC name and quest title.
 Quest continuity is mandatory: once an NPC gives the player a quest, that quest giver
 must not then block, revoke, or add arbitrary prerequisites that prevent the player from
@@ -615,7 +621,18 @@ action explicitly and successfully changes it."""
                             and str(memory.get("fact", "")).strip()
                         ] if isinstance(result.get("npc_memories", []), list) else [],
                         "quest_offers": [
-                            offer for offer in result.get("quest_offers", [])
+                            {
+                                **offer,
+                                "reward_items": [
+                                    it for it in offer.get("reward_items", [])
+                                    if isinstance(it, dict) and str(it.get("name", "")).strip()
+                                ] if isinstance(offer.get("reward_items", []), list) else [],
+                                "reward_spells": [
+                                    it for it in offer.get("reward_spells", [])
+                                    if isinstance(it, dict) and str(it.get("name", "")).strip()
+                                ] if isinstance(offer.get("reward_spells", []), list) else []
+                            }
+                            for offer in result.get("quest_offers", [])
                             if isinstance(offer, dict)
                             and str(offer.get("npc_name", "")).strip()
                             and str(offer.get("title", "")).strip()
