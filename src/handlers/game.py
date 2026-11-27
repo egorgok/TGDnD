@@ -28,7 +28,6 @@ import re
 import json
 import html
 from datetime import datetime
-from types import SimpleNamespace
 from typing import Optional
 from io import BytesIO
 
@@ -92,7 +91,10 @@ def _last_narrated_distance_feet(entity_name: str, recent_actions: list) -> Opti
             r"(подхожу|приближаюсь|подойти|иду к|направляюсь к|"
             r"бегу.{0,50}(?:на|к)|несусь.{0,50}(?:на|к)|"
             r"бросаюсь.{0,50}(?:на|к)|кидаюсь.{0,50}(?:на|к))",
-            (entry.action_description or "").casefold()
+            (
+                entry.get("action_description", "") if isinstance(entry, dict)
+                else entry.action_description or ""
+            ).casefold()
         )
         for entry in recent_actions
     ):
@@ -103,7 +105,10 @@ def _last_narrated_distance_feet(entity_name: str, recent_actions: list) -> Opti
         re.IGNORECASE
     )
     for entry in recent_actions:
-        text = entry.ai_response or ""
+        text = (
+            entry.get("ai_response", "") if isinstance(entry, dict)
+            else entry.ai_response or ""
+        )
         for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
             if name not in sentence.casefold():
                 continue
@@ -137,11 +142,33 @@ def _remove_target_distance_claims(narrative: str, target_name: str) -> str:
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", narrative):
         if (
             target_name.casefold() in sentence.casefold()
-            and re.search(r"\d|фут|ft\b|метр|м\b", sentence.casefold())
+            and re.search(
+                r"\d+(?:[.,]\d+)?\s*(?:фут\w*|ft\b|метр\w*|м\b)|"
+                r"(?:ноль|один|одна|два|две|три|четыре|пять|шесть|семь|"
+                r"восемь|девять|десять|пара|полтора)\s+"
+                r"(?:фут\w*|ft\b|метр\w*|м\b)",
+                sentence.casefold()
+            )
         ):
             continue
         kept.append(sentence)
     return " ".join(part.strip() for part in kept if part.strip())
+
+
+def _sanitize_combat_narrative(narrative: str) -> str:
+    """Keep tactical numbers and implementation details out of the DM prose."""
+    kept = []
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", narrative or ""):
+        lowered = sentence.casefold()
+        if re.search(r"\d+(?:[.,]\d+)?\s*(?:фут\w*|ft\b|метр\w*|м\b)", lowered):
+            continue
+        if any(term in lowered for term in (
+            "боевая система", "игровая система", "код разреш", "механика разреш",
+            "система определит", "система проверит"
+        )):
+            continue
+        kept.append(sentence.strip())
+    return " ".join(sentence for sentence in kept if sentence)
 
 
 async def _send_generated_image(send_photo, prompt: str, caption: str) -> bool:
@@ -320,18 +347,27 @@ def _choose_weapon(weapons: list[Item], action: str) -> Optional[Item]:
 
 
 def _roll_entity_damage(dice: str, critical: bool = False) -> int:
+    return _roll_entity_damage_detail(dice, critical=critical)[0]
+
+
+def _roll_entity_damage_detail(dice: str, critical: bool = False) -> tuple[int, str]:
     match = re.fullmatch(r"(\d*)d(\d+)(?:\s*([+-])\s*(\d+))?", dice or "")
     if not match:
-        return 1
+        return 1, "1"
     count, sides = int(match.group(1) or 1), int(match.group(2))
     if count < 1 or count > 10 or sides < 2 or sides > 100:
-        return 1
+        return 1, "1"
     if critical:
         count = min(count * 2, 20)
     bonus = int(match.group(4) or 0)
     if match.group(3) == "-":
         bonus *= -1
-    return max(0, sum(GameEngineService.roll_dice(f"d{sides}") for _ in range(count)) + bonus)
+    rolls = [GameEngineService.roll_dice(f"d{sides}") for _ in range(count)]
+    total = max(0, sum(rolls) + bonus)
+    detail = f"{count}d{sides} ({', '.join(map(str, rolls))})"
+    if bonus:
+        detail += f" {'+' if bonus > 0 else '-'} {abs(bonus)}"
+    return total, detail
 
 
 def _sanitize_custom_item(raw_item: dict) -> Optional[dict]:
@@ -857,14 +893,9 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 "attack_bonus": entity.attack_bonus,
                 "damage_dice": entity.damage_dice,
                 "hostile": entity.is_hostile,
-                "distance_ft": round(
-                    narrated_distance
-                    if (narrated_distance := _last_narrated_distance_feet(
-                        entity.name, recent_actions
-                    )) is not None
-                    else entity.distance_m * 3.28084,
-                    1
-                ),
+                # Stored position is authoritative; narrative history can contain
+                # outdated or contradictory distances.
+                "distance_ft": round(entity.distance_m * 3.28084, 1),
                 "alive": entity.is_alive
             }
             for entity in entities
@@ -934,7 +965,10 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 creature_catalog=build_creature_catalog(db),
                 item_catalog=build_item_catalog(db),
                 inventory=[
-                    row["item"].name
+                    {
+                        "name": row["item"].name,
+                        "quantity": row["quantity"]
+                    }
                     for row in InventoryService.get_inventory(db, character.id)
                     if row.get("item")
                 ],
@@ -944,9 +978,38 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     "copper": purse.copper
                 } if purse else {"gold": 0, "silver": 0, "copper": 0}
             )
+            # Persist and de-duplicate any existing rows before applying new loot.
+            for item_id, in db.query(Inventory.item_id).filter(
+                Inventory.character_id == character.id
+            ).distinct().all():
+                rows = db.query(Inventory).filter(
+                    Inventory.character_id == character.id,
+                    Inventory.item_id == item_id
+                ).order_by(Inventory.id).all()
+                if len(rows) > 1:
+                    canonical_row = rows[0]
+                    canonical_row.quantity = sum(max(0, row.quantity or 0) for row in rows)
+                    canonical_row.is_equipped = any(row.is_equipped for row in rows)
+                    canonical_row.slot = canonical_row.slot or next(
+                        (row.slot for row in rows[1:] if row.slot), None
+                    )
+                    for duplicate_row in rows[1:]:
+                        db.delete(duplicate_row)
+            db.commit()
             if arena_opponent and isinstance(ai_result, dict):
                 ai_result["target_name"] = arena_opponent.name
                 ai_result["enemy_attacks"] = arena_opponent.distance_m <= 1
+
+            if isinstance(ai_result, dict) and ai_result.get("provider_error"):
+                await thinking_msg.delete()
+                await message.answer(
+                    ai_result["narrative"],
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]
+                    ])
+                )
+                await state.clear()
+                return
 
             # Save AI-awarded loot silently; its narrative is shown as usual.
             narrative = ai_result.get("narrative", "") if isinstance(ai_result, dict) else str(ai_result)
@@ -1037,7 +1100,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 entity_distance_m = _safe_int(found_entity.get("distance_m"), 5, 0, 1000)
                 narrated_distance_ft = _last_narrated_distance_feet(
                     name,
-                    [SimpleNamespace(ai_response=narrative, action_description="")]
+                    [{"ai_response": narrative, "action_description": ""}]
                 )
                 if narrated_distance_ft is not None:
                     entity_distance_m = max(0, int(narrated_distance_ft / 3.28084))
@@ -1191,6 +1254,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
 
             homebrew_spell_warning = ""
             newly_added_improvised_weapons = []
+            acquired_via_custom_items: dict[int, int] = {}
             if isinstance(ai_result, dict):
                 for raw_item in ai_result.get("custom_items", []):
                     definition = _sanitize_custom_item(raw_item)
@@ -1249,6 +1313,10 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                                 is_equipped=is_armor or is_weapon,
                                 slot="armor" if is_armor else "weapon" if is_weapon else None
                             ))
+                            db.flush()
+                            # custom_items and loot often describe the same pickup;
+                            # remember this award so the loot pass doesn't grant it twice.
+                            acquired_via_custom_items[custom_item.id] = 1
                         if custom_item.item_type == "weapon:improvised":
                             newly_added_improvised_weapons.append(custom_item)
                 db.flush()
@@ -1333,11 +1401,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
 
             target_distance_feet = None
             if target:
-                target_distance_feet = _last_narrated_distance_feet(
-                    target.name, recent_actions
-                )
-                if target_distance_feet is None:
-                    target_distance_feet = target.distance_m * 3.28084
+                target_distance_feet = target.distance_m * 3.28084
                 approach_action = bool(re.search(
                     r"\b(подхожу|приближаюсь|подойти|иду к|направляюсь к)\b",
                     lower_action
@@ -1347,28 +1411,31 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     r"(?:на|к|в сторону)\b",
                     lower_action
                 ))
-                if is_attack_action or approach_action or charge_action:
-                    narrative = _remove_target_distance_claims(narrative, target.name)
+                # Narrative is never allowed to update or contradict the stored
+                # tactical distance, even when the player simply waits or talks.
+                narrative = _remove_target_distance_claims(narrative, target.name)
+                narrative = _sanitize_combat_narrative(narrative)
                 if approach_action or charge_action:
                     target_distance_feet = max(
                         0,
                         target_distance_feet - (29.5276 if charge_action else 9.84252)
                     )
-                    target.distance_m = max(0, int(target_distance_feet / 3.28084))
-                narrative += (
-                    f"\n\n📏 Дистанция до {target.name}: "
-                    f"{target_distance_feet:.1f} фт."
-                )
+                    target.distance_m = int(target_distance_feet / 3.28084)
                 if is_attack_action:
-                    narrative += (
-                        f"\n\n📏 На момент атаки до {target.name} "
-                        f"{target_distance_feet:.1f} фт."
-                    )
+                    narrative = re.sub(r"\s+", " ", narrative).strip()
 
             active_encounter = None
             active_game_session = None
             combat_started = False
             initiative_result = None
+            had_active_combat = bool(
+                db.query(CombatEncounter.id).join(
+                    GameSession, GameSession.id == CombatEncounter.session_id
+                ).filter(
+                    GameSession.group_id == character.group_id,
+                    CombatEncounter.is_active.is_(True)
+                ).first()
+            )
             if target and (
                 is_attack_action
                 or enemy_attacks
@@ -1396,6 +1463,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         f"{target.name} — {enemy_initiative}."
                     )
 
+            player_combat_text = ""
             if is_attack_action and target:
                 carried_weapons = db.query(Item).join(
                     Inventory, Inventory.item_id == Item.id
@@ -1429,8 +1497,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     long_range_feet = int(weapon_range.group(2) or normal_range_feet)
                     if target_distance_feet > long_range_feet:
                         narrative += (
-                            f"\n\n❌ {target.name} вне дальности {weapon.name} "
-                            f"({long_range_feet} фт.)."
+                            f"\n\n❌ {weapon.name} не достаёт до {target.name}."
                         )
                         weapon_out_of_range = True
                     else:
@@ -1442,8 +1509,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     pass
                 elif target_distance_feet > 5 and not is_ranged_weapon:
                     narrative += (
-                        f"\n\n❌ {target.name} вне дистанции ближней атаки: "
-                        f"{target_distance_feet:.1f} фт. (максимум 5 фт.)."
+                        f"\n\n❌ {target.name} слишком далеко для удара этим оружием."
                     )
                 else:
                     attributes = db.query(CharacterAttribute).filter(
@@ -1473,23 +1539,27 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         second_roll = GameEngineService.roll_d20()
                         attack_roll = min(attack_roll, second_roll)
                     attack_total = attack_roll + attack_bonus
-                    attack_check_text = (
-                        f"🎲 Атака ({ability_label}): "
-                        f"{f'd20({first_attack_roll}) и d20({second_roll}) (помеха)' if long_range_disadvantage else f'd20({attack_roll})'}"
-                        f" + {ability_modifier} ({ability_label.lower()}) + "
-                        f"{GameEngineService.calculate_proficiency_bonus(character.level)} "
-                        f"(владение) = {attack_total} против КД {target.armor_class}."
+                    dice_detail = (
+                        f"d20({first_attack_roll}) и d20({second_roll}), помеха"
+                        if long_range_disadvantage
+                        else f"d20({attack_roll})"
                     )
-                    if attack_roll == 20 or (attack_roll != 1 and attack_total >= target.armor_class):
+                    hit = attack_roll == 20 or (attack_roll != 1 and attack_total >= target.armor_class)
+                    if hit:
                         damage_dice = weapon.damage_dice if weapon and weapon.damage_dice else "d4"
                         fixed_damage = damage_dice.isdigit()
-                        damage = (
-                            int(damage_dice)
-                            if fixed_damage
-                            else max(1, _roll_entity_damage(damage_dice) + ability_modifier)
-                        )
-                        if attack_roll == 20 and not fixed_damage:
-                            damage += _roll_entity_damage(damage_dice)
+                        if fixed_damage:
+                            base_damage = int(damage_dice)
+                            base_detail = str(base_damage)
+                            crit_damage = 0
+                            crit_detail = ""
+                        else:
+                            base_damage, base_detail = _roll_entity_damage_detail(damage_dice)
+                            crit_damage, crit_detail = (
+                                _roll_entity_damage_detail(damage_dice)
+                                if attack_roll == 20 else (0, "")
+                            )
+                        damage = max(1, base_damage + crit_damage + (0 if fixed_damage else ability_modifier))
                         target.current_hp = max(0, target.current_hp - damage)
                         if target.current_hp == 0:
                             target.is_alive = False
@@ -1507,24 +1577,34 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                             )
                             if weapon else ""
                         )
-                        damage_label = f" урона ({damage_type})" if damage_type else " урона"
-                        narrative += (
-                            f"\n\n⚔️ {weapon.name if weapon else 'Безоружная атака'}: "
-                            f"{attack_check_text} Попадание! {target.name} получает "
-                            f"{damage}{damage_label}: "
-                            f"{target.current_hp}/{target.max_hp} HP."
+                        damage_type_text = f" {damage_type}" if damage_type else ""
+                        if fixed_damage:
+                            damage_detail = f"{damage}{damage_type_text}"
+                        else:
+                            dmg_parts = [base_detail]
+                            if crit_damage:
+                                dmg_parts.append(f"{crit_detail} крит")
+                            if ability_modifier:
+                                dmg_parts.append(f"{ability_modifier:+d} мод.")
+                            damage_detail = f"{' + '.join(dmg_parts)} = {damage}{damage_type_text}"
+                        player_combat_text += (
+                            f"\n\n🎯 Попадание по {target.name}. "
+                            f"Кубики: {dice_detail}; атака {attack_total} против КД {target.armor_class}; "
+                            f"урон {damage_detail}. "
+                            f"HP цели: {target.current_hp}/{target.max_hp}."
                         )
                         if not target.is_alive:
-                            narrative += f"\n☠️ {target.name} повержен."
+                            player_combat_text += f" {target.name} повержен."
                     else:
-                        narrative += (
-                            f"\n\n⚔️ {weapon.name if weapon else 'Безоружная атака'}: "
-                            f"{attack_check_text} Промах — урона нет."
+                        player_combat_text += (
+                            f"\n\n⚔️ Промах по {target.name}. "
+                            f"Кубики: {dice_detail}; атака {attack_total} против КД {target.armor_class}."
                         )
 
             loot = ai_result.get("loot", []) if isinstance(ai_result, dict) else []
             if not loot:
                 loot = _loot_from_explicit_action(action_description)
+            loot_quantities_by_item: dict[int, tuple[Item, int]] = {}
             for found in loot:
                 if not isinstance(found, dict):
                     continue
@@ -1532,9 +1612,11 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 if not name:
                     continue
                 try:
-                    quantity = max(1, min(int(found.get("quantity", 1)), 1000))
+                    quantity = max(0, min(int(found.get("quantity", 1)), 1000))
                 except (TypeError, ValueError):
                     quantity = 1
+                if quantity == 0:
+                    continue
                 item = db.query(Item).filter(Item.name.ilike(name)).first()
                 if item is None:
                     item = InventoryService.create_item(
@@ -1546,7 +1628,35 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         is_stackable=True
                     )
                 if item is not None:
-                    InventoryService.add_item(db, character.id, item.id, quantity=quantity)
+                    previous = loot_quantities_by_item.get(item.id)
+                    loot_quantities_by_item[item.id] = (
+                        item,
+                        max(quantity, previous[1] if previous else 0)
+                    )
+            for item_id, (item, reported_quantity) in loot_quantities_by_item.items():
+                quantity_to_add = max(
+                    0,
+                    reported_quantity - acquired_via_custom_items.get(item_id, 0)
+                )
+                if quantity_to_add <= 0:
+                    continue
+                rows = db.query(Inventory).filter(
+                    Inventory.character_id == character.id,
+                    Inventory.item_id == item_id
+                ).order_by(Inventory.id).all()
+                if rows:
+                    rows[0].quantity = sum(max(0, row.quantity or 0) for row in rows) + quantity_to_add
+                    for duplicate in rows[1:]:
+                        db.delete(duplicate)
+                else:
+                    db.add(Inventory(
+                        character_id=character.id,
+                        item_id=item_id,
+                        quantity=quantity_to_add,
+                        is_equipped=False,
+                        slot=None
+                    ))
+            db.commit()
 
             if homebrew_spell_warning:
                 narrative += homebrew_spell_warning
@@ -1577,65 +1687,144 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     damage_text += "\n☠️ Персонаж погиб. Дальнейшие действия невозможны."
 
             enemy_attack_text = ""
-            if (
-                character.current_hp > 0
-                and isinstance(ai_result, dict)
-                and ai_result.get("enemy_attacks")
-                and target and target.is_hostile and target.is_alive
-                and target_distance_feet is not None and target_distance_feet <= 5
-            ):
-                attributes = db.query(CharacterAttribute).filter(
-                    CharacterAttribute.character_id == character.id
-                ).first()
-                player_ac = GameEngineService.calculate_armor_class(character, attributes, db)
+            # A player action is one combat round: after it resolves, every living
+            # hostile combatant in reach gets exactly one response, in DEX order.
+            # Do not rely on the model's enemy_attacks flag for turn advancement.
+            hostiles = db.query(GameEntity).filter(
+                GameEntity.character_id == character.id,
+                GameEntity.is_alive.is_(True),
+                GameEntity.is_hostile.is_(True)
+            ).order_by(GameEntity.id).all()
+            player_attributes = db.query(CharacterAttribute).filter(
+                CharacterAttribute.character_id == character.id
+            ).first()
+            player_ac = GameEngineService.calculate_armor_class(
+                character, player_attributes, db
+            )
+            # Only take a full enemy turn if combat was already underway or was
+            # initiated by this player's declared attack / the DM's hostile event.
+            enemy_turn_due = bool(
+                had_active_combat or combat_started or enemy_attacks or is_attack_action
+            )
+            enemy_lines = []
+            active_hostiles = hostiles
+            if enemy_turn_due:
+                if active_game_session is None:
+                    active_game_session = db.query(GameSession).filter(
+                        GameSession.group_id == character.group_id
+                    ).first()
+                turn_state = {}
+                if active_game_session and active_game_session.turn_order:
+                    try:
+                        turn_state = json.loads(active_game_session.turn_order)
+                        if not isinstance(turn_state, dict):
+                            turn_state = {}
+                    except (TypeError, json.JSONDecodeError):
+                        turn_state = {}
+                combat_enemy_ids = {
+                    int(enemy_id) for enemy_id in turn_state.get("combat_enemy_ids", [])
+                    if str(enemy_id).isdigit()
+                }
+                # Seed/refresh the encounter roster. On a new combat, include nearby
+                # hostiles; on existing combats with an empty/legacy roster, include
+                # all living hostiles so no combatant is skipped.
+                if combat_started:
+                    combat_enemy_ids.update(
+                        enemy.id for enemy in hostiles
+                        if enemy.distance_m <= 10 or (target and enemy.id == target.id)
+                    )
+                elif not combat_enemy_ids:
+                    combat_enemy_ids.update(enemy.id for enemy in hostiles)
+                if target and (is_attack_action or enemy_attacks):
+                    combat_enemy_ids.add(target.id)
+                active_hostiles = [
+                    enemy for enemy in hostiles if enemy.id in combat_enemy_ids
+                ]
+                # Keep roster non-empty during active combat.
+                if not active_hostiles and hostiles:
+                    active_hostiles = hostiles
+                turn_state["combat_enemy_ids"] = [
+                    enemy.id for enemy in active_hostiles
+                ]
+                enemy_initiatives = turn_state.setdefault("enemy_initiatives", {})
+                for enemy in active_hostiles:
+                    if str(enemy.id) not in enemy_initiatives:
+                        enemy_initiatives[str(enemy.id)] = CombatService.roll_initiative(
+                            (enemy.attack_bonus or 0) // 2
+                        )
+                active_hostiles.sort(
+                    key=lambda entity: enemy_initiatives.get(str(entity.id), 0),
+                    reverse=True
+                )
+                if active_game_session:
+                    active_game_session.turn_order = json.dumps(
+                        turn_state, ensure_ascii=False
+                    )
+            for enemy in active_hostiles if enemy_turn_due else []:
+                if character.current_hp <= 0:
+                    break
+                # The model cannot move a known combatant. Explicit charge/approach
+                # actions update persisted distance above; otherwise use stored range.
+                distance_ft = (
+                    target_distance_feet if target and enemy.id == target.id
+                    and target_distance_feet is not None
+                    else enemy.distance_m * 3.28084
+                )
+                if distance_ft > 5:
+                    enemy.distance_m = max(0, enemy.distance_m - 2)
+                    distance_ft = enemy.distance_m * 3.28084
+                if distance_ft > 5:
+                    enemy_lines.append(f"{enemy.name} не успевает сблизиться.")
+                    continue
                 enemy_roll = GameEngineService.roll_d20()
-                if enemy_roll == 20 or (enemy_roll != 1 and enemy_roll + target.attack_bonus >= player_ac):
-                    enemy_damage = _roll_entity_damage(
-                        target.damage_dice,
+                enemy_total = enemy_roll + enemy.attack_bonus
+                if enemy_roll == 20 or (enemy_roll != 1 and enemy_total >= player_ac):
+                    enemy_damage, damage_detail = _roll_entity_damage_detail(
+                        enemy.damage_dice,
                         critical=enemy_roll == 20
                     )
                     old_hp = character.current_hp
                     character.current_hp = max(0, character.current_hp - enemy_damage)
-                    db.commit()
-                    enemy_attack_total = enemy_roll + target.attack_bonus
-                    enemy_attack_text = (
-                        f"\n\n🩸 {target.name} атакует. 🎲 Проверка атаки: "
-                        f"d20({enemy_roll}) + {target.attack_bonus} = {enemy_attack_total} "
-                        f"против вашей КД {player_ac} — попадание, "
-                        f"{old_hp - character.current_hp} урона. "
-                        f"Ваше HP: {character.current_hp}/{character.max_hp}."
+                    crit_note = ", крит" if enemy_roll == 20 else ""
+                    enemy_lines.append(
+                        f"{enemy.name}: d20({enemy_roll}) + {enemy.attack_bonus} = "
+                        f"{enemy_total} против КД {player_ac} — попадание, "
+                        f"урон {damage_detail} = {old_hp - character.current_hp}{crit_note}."
                     )
                 else:
-                    enemy_attack_total = enemy_roll + target.attack_bonus
-                    enemy_attack_text = (
-                        f"\n\n🛡️ {target.name} атакует. 🎲 Проверка атаки: "
-                        f"d20({enemy_roll}) + {target.attack_bonus} = {enemy_attack_total} "
-                        f"против вашей КД {player_ac} — промах."
+                    enemy_lines.append(
+                        f"{enemy.name}: d20({enemy_roll}) + {enemy.attack_bonus} = "
+                        f"{enemy_total} против КД {player_ac} — промах."
                     )
-            elif (
-                isinstance(ai_result, dict)
-                and ai_result.get("enemy_attacks")
-                and target and target.is_hostile and target.is_alive
-                and target_distance_feet is not None and target_distance_feet > 5
-            ):
+            if enemy_lines:
+                db.commit()
                 enemy_attack_text = (
-                    f"\n\n📏 {target.name} пока слишком далеко для ближней атаки: "
-                    f"{target_distance_feet:.1f} фт."
+                    "\n\n🩸 <b>Ход противников:</b>\n"
+                    + "\n".join(f"• {line}" for line in enemy_lines)
+                    + f"\nВаше HP: {character.current_hp}/{character.max_hp}."
+                )
+            if enemy_turn_due and active_game_session:
+                active_game_session.combat_active = bool(
+                    db.query(CombatEncounter.id).join(
+                        GameSession, GameSession.id == CombatEncounter.session_id
+                    ).filter(
+                        GameSession.group_id == character.group_id,
+                        CombatEncounter.is_active.is_(True)
+                    ).first()
                 )
 
+            if enemy_turn_due and active_game_session is None:
+                active_game_session = db.query(GameSession).filter(
+                    GameSession.group_id == character.group_id
+                ).first()
             if active_encounter and target:
                 active_encounter.enemy_hp = target.current_hp
-                if not target.is_alive:
-                    active_encounter.is_active = False
-                elif not combat_started:
+            if active_encounter:
+                active_encounter.is_active = bool(active_hostiles)
+                if not combat_started:
                     active_encounter.round = (active_encounter.round or 1) + 1
-                if active_game_session:
-                    active_game_session.combat_active = bool(
-                        db.query(CombatEncounter.id).filter(
-                            CombatEncounter.session_id == active_game_session.id,
-                            CombatEncounter.is_active.is_(True)
-                        ).first()
-                    )
+            if active_game_session and enemy_turn_due:
+                active_game_session.combat_active = bool(active_hostiles)
 
             progression_note = ""
             if xp_earned > 0:
@@ -1722,7 +1911,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
 
 {roll_text}
 <b>Результат:</b>
-{narrative}{damage_text}{enemy_attack_text}{currency_note}
+{narrative}{player_combat_text}{damage_text}{enemy_attack_text}{currency_note}
 """
 
             await thinking_msg.delete()
@@ -2217,21 +2406,22 @@ async def inventory_command(message: types.Message):
             return
 
         # Get inventory
-        inventory_items = db.query(Inventory).filter(
-            Inventory.character_id == character.id
-        ).all()
+        inventory_items = InventoryService.get_inventory(db, character.id)
 
         inventory_text = f"<b>🎒 Инвентарь {character.name}</b>\n\n"
 
         if inventory_items:
             total_weight = 0
-            for idx, inv in enumerate(inventory_items, 1):
-                item = db.query(Item).filter(Item.id == inv.item_id).first()
-                equipped = "✓ " if inv.is_equipped else "  "
-                weight = float(item.weight or 0) * inv.quantity
+            for idx, row in enumerate(inventory_items, 1):
+                item = row["item"]
+                if not item:
+                    continue
+                quantity = row["quantity"]
+                equipped = "✓ " if row["is_equipped"] else "  "
+                weight = float(item.weight or 0) * quantity
                 total_weight += weight
                 inventory_text += (
-                    f"{idx}. {equipped}<b>{item.name}</b> x{inv.quantity}\n"
+                    f"{idx}. {equipped}<b>{item.name}</b> x{quantity}\n"
                     f"   Вес: {weight:.1f} фн | Тип: {localized_item_type(item.item_type)}\n"
                 )
             inventory_text += f"\n<b>Общий вес:</b> {total_weight:.1f} фунтов"

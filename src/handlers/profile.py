@@ -10,6 +10,7 @@ from src.models import (
 from src.services import CharacterService
 from src.services import GameEngineService
 from src.services.open5e_localization import localized_feature_description
+from src.services.inventory_service import InventoryService
 from src.services.character_service import xp_for_next_level
 from src.utils import format_error
 import logging
@@ -67,9 +68,7 @@ async def profile_command(message: types.Message):
         armor_class = GameEngineService.calculate_armor_class(character, attributes, db)
 
         # Get inventory
-        inventory = db.query(Inventory).filter(
-            Inventory.character_id == character.id
-        ).all()
+        inventory = InventoryService.get_inventory(db, character.id)
         abilities = db.query(CharacterAbility).filter(
             CharacterAbility.character_id == character.id,
             CharacterAbility.is_class.is_(True)
@@ -113,10 +112,11 @@ async def profile_command(message: types.Message):
 """
 
         if inventory:
-            for inv in inventory:
-                item = db.query(Item).filter(Item.id == inv.item_id).first()
-                equipped = "✓" if inv.is_equipped else " "
-                profile_text += f"\n[{equipped}] {item.name} x{inv.quantity}"
+            for row in inventory:
+                item = row["item"]
+                if item:
+                    equipped = "✓" if row["is_equipped"] else " "
+                    profile_text += f"\n[{equipped}] {item.name} x{row['quantity']}"
         else:
             profile_text += "\nПуст"
 
@@ -172,21 +172,22 @@ async def show_inventory_callback(query: types.CallbackQuery):
             await query.answer("❌ Персонаж не найден")
             return
 
-        inventory = db.query(Inventory).filter(
-            Inventory.character_id == character.id
-        ).all()
+        inventory = InventoryService.get_inventory(db, character.id)
 
         inventory_text = "<b>🎒 Полный инвентарь</b>\n\n"
 
         if inventory:
             total_weight = 0
-            for inv in inventory:
-                item = db.query(Item).filter(Item.id == inv.item_id).first()
-                equipped = "✓ " if inv.is_equipped else "  "
-                weight = float(item.weight or 0) * inv.quantity
+            for row in inventory:
+                item = row["item"]
+                if not item:
+                    continue
+                quantity = row["quantity"]
+                equipped = "✓ " if row["is_equipped"] else "  "
+                weight = float(item.weight or 0) * quantity
                 total_weight += weight
                 inventory_text += (
-                    f"{equipped}<b>{item.name}</b> x{inv.quantity}\n"
+                    f"{equipped}<b>{item.name}</b> x{quantity}\n"
                     f"   Вес: {weight:.1f} фунтов\n"
                     f"   {item.description or 'Нет описания'}\n\n"
                 )

@@ -1,7 +1,7 @@
 import logging
 from typing import Optional, List
 from sqlalchemy.orm import Session
-from sqlalchemy import and_
+from sqlalchemy import and_, func
 from src.models import Item, Inventory, Character
 
 logger = logging.getLogger(__name__)
@@ -20,16 +20,20 @@ class InventoryService:
     ) -> Optional[Inventory]:
         """Add item to character inventory"""
         try:
-            # Check if item already in inventory
-            existing = db.query(Inventory).filter(
-                and_(
-                    Inventory.character_id == character_id,
-                    Inventory.item_id == item_id
-                )
-            ).first()
+            # Collapse historical duplicate rows before applying the new quantity.
+            rows = db.query(Inventory).filter(
+                Inventory.character_id == character_id,
+                Inventory.item_id == item_id
+            ).order_by(Inventory.id).all()
+            existing = rows[0] if rows else None
 
             if existing:
-                existing.quantity += quantity
+                existing.quantity = sum(max(0, row.quantity or 0) for row in rows) + quantity
+                for duplicate in rows[1:]:
+                    existing.is_equipped = existing.is_equipped or duplicate.is_equipped
+                    if existing.slot is None:
+                        existing.slot = duplicate.slot
+                    db.delete(duplicate)
                 db.commit()
                 logger.info(f"Updated inventory item {item_id} for character {character_id}")
                 return existing
@@ -55,18 +59,21 @@ class InventoryService:
     def remove_item(db: Session, character_id: int, item_id: int, quantity: int = 1) -> bool:
         """Remove item from inventory"""
         try:
-            inventory = db.query(Inventory).filter(
+            rows = db.query(Inventory).filter(
                 and_(
                     Inventory.character_id == character_id,
                     Inventory.item_id == item_id
                 )
-            ).first()
+            ).order_by(Inventory.id).all()
 
-            if not inventory:
+            if not rows:
                 logger.warning(f"Item {item_id} not found in character {character_id} inventory")
                 return False
 
-            inventory.quantity -= quantity
+            inventory = rows[0]
+            inventory.quantity = sum(max(0, row.quantity or 0) for row in rows) - quantity
+            for duplicate in rows[1:]:
+                db.delete(duplicate)
             if inventory.quantity <= 0:
                 db.delete(inventory)
             db.commit()
@@ -82,18 +89,30 @@ class InventoryService:
     def get_inventory(db: Session, character_id: int) -> List[dict]:
         """Get all items in character inventory"""
         try:
-            items = db.query(Inventory).filter(
+            items = db.query(
+                Inventory.item_id,
+                func.sum(Inventory.quantity).label("quantity"),
+                func.bool_or(Inventory.is_equipped).label("is_equipped")
+            ).filter(
                 Inventory.character_id == character_id
-            ).all()
+            ).group_by(Inventory.item_id).all()
 
             result = []
-            for inv in items:
-                item = db.query(Item).filter(Item.id == inv.item_id).first()
+            slot_by_item = {}
+            for item_id, slot in db.query(
+                Inventory.item_id, Inventory.slot
+            ).filter(
+                Inventory.character_id == character_id,
+                Inventory.is_equipped.is_(True)
+            ).all():
+                slot_by_item.setdefault(item_id, slot)
+            for item_id, quantity, is_equipped in items:
+                item = db.query(Item).filter(Item.id == item_id).first()
                 result.append({
                     "item": item,
-                    "quantity": inv.quantity,
-                    "is_equipped": inv.is_equipped,
-                    "slot": inv.slot
+                    "quantity": quantity or 0,
+                    "is_equipped": bool(is_equipped),
+                    "slot": slot_by_item.get(item_id)
                 })
             return result
 
@@ -105,18 +124,21 @@ class InventoryService:
     def equip_item(db: Session, character_id: int, item_id: int, slot: str) -> bool:
         """Equip item to slot"""
         try:
-            inventory = db.query(Inventory).filter(
+            rows = db.query(Inventory).filter(
                 and_(
                     Inventory.character_id == character_id,
                     Inventory.item_id == item_id
                 )
-            ).first()
+            ).order_by(Inventory.id).all()
 
-            if not inventory:
+            if not rows:
                 return False
 
+            inventory = rows[0]
             inventory.is_equipped = True
             inventory.slot = slot
+            for duplicate in rows[1:]:
+                db.delete(duplicate)
             db.commit()
             logger.info(f"Equipped item {item_id} to slot {slot} for character {character_id}")
             return True
@@ -130,18 +152,21 @@ class InventoryService:
     def unequip_item(db: Session, character_id: int, item_id: int) -> bool:
         """Unequip item"""
         try:
-            inventory = db.query(Inventory).filter(
+            rows = db.query(Inventory).filter(
                 and_(
                     Inventory.character_id == character_id,
                     Inventory.item_id == item_id
                 )
-            ).first()
+            ).order_by(Inventory.id).all()
 
-            if not inventory:
+            if not rows:
                 return False
 
-            inventory.is_equipped = False
-            inventory.slot = None
+            for inventory in rows:
+                inventory.is_equipped = False
+                inventory.slot = None
+            for duplicate in rows[1:]:
+                db.delete(duplicate)
             db.commit()
             logger.info(f"Unequipped item {item_id} for character {character_id}")
             return True

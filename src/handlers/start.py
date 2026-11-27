@@ -12,6 +12,7 @@ from src.models import (
 )
 from src.services import RulesService, GameEngineService
 from src.services.character_service import xp_for_next_level
+from src.services.inventory_service import InventoryService
 from src.services.open5e_localization import localized_feature_description, localized_item_type
 import logging
 
@@ -304,19 +305,25 @@ async def inventory_menu_callback(query: types.CallbackQuery):
         inventory_items = db.query(Inventory).filter(
             Inventory.character_id == character.id
         ).all()
+        grouped_inventory = {}
+        for inv in inventory_items:
+            grouped_inventory.setdefault(inv.item_id, []).append(inv)
 
         inventory_text = f"<b>🎒 Инвентарь {character.name}</b>\n\n"
 
-        if inventory_items:
+        if grouped_inventory:
             total_weight = 0
-            for idx, inv in enumerate(inventory_items, 1):
-                item = db.query(Item).filter(Item.id == inv.item_id).first()
+            for idx, (item_id, rows) in enumerate(grouped_inventory.items(), 1):
+                inv = rows[0]
+                quantity = sum(max(0, row.quantity or 0) for row in rows)
+                equipped_state = any(row.is_equipped for row in rows)
+                item = db.query(Item).filter(Item.id == item_id).first()
                 if item:
-                    equipped = "✓ " if inv.is_equipped else "  "
-                    weight = float(item.weight or 0) * inv.quantity
+                    equipped = "✓ " if equipped_state else "  "
+                    weight = float(item.weight or 0) * quantity
                     total_weight += weight
                     inventory_text += (
-                        f"{idx}. {equipped}<b>{item.name}</b> x{inv.quantity}\n"
+                        f"{idx}. {equipped}<b>{item.name}</b> x{quantity}\n"
                         f"   Вес: {weight:.1f} фн | Тип: {localized_item_type(item.item_type)}\n"
                     )
             inventory_text += f"\n<b>Общий вес:</b> {total_weight:.1f} фунтов"
@@ -392,9 +399,7 @@ async def show_profile_callback(query: types.CallbackQuery):
             CharacterAttribute.character_id == character.id
         ).first()
         armor_class = GameEngineService.calculate_armor_class(character, attributes, db)
-        inventory = db.query(Inventory).filter(
-            Inventory.character_id == character.id
-        ).all()
+        inventory = InventoryService.get_inventory(db, character.id)
         abilities = db.query(CharacterAbility).filter(
             CharacterAbility.character_id == character.id,
             CharacterAbility.is_class.is_(True)
@@ -436,9 +441,9 @@ async def show_profile_callback(query: types.CallbackQuery):
         profile_text += "\n<b>🎒 Снаряжение:</b>"
         if inventory:
             for entry in inventory:
-                item = db.query(Item).filter(Item.id == entry.item_id).first()
+                item = entry["item"]
                 if item:
-                    profile_text += f"\n• {item.name} ×{entry.quantity}"
+                    profile_text += f"\n• {item.name} ×{entry['quantity']}"
         else:
             profile_text += "\nПусто"
         if abilities:

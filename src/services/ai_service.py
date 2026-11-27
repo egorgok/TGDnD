@@ -2,13 +2,54 @@ import httpx
 import base64
 import json
 import re
+import asyncio
+import random
+import time
 from typing import Optional
 from config.settings import get_settings
 import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _is_rate_limited_response(response: httpx.Response) -> bool:
+    if response.status_code == 429:
+        return True
+    if "route_rate_limit_exceeded" in response.text:
+        return True
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    error = payload.get("error", {}) if isinstance(payload, dict) else {}
+    code = error.get("code") if isinstance(error, dict) else None
+    return code == "route_rate_limit_exceeded"
+
+
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return min(30.0, max(0.5, float(retry_after)))
+        except ValueError:
+            pass
+    # Bounded exponential backoff with jitter avoids hammering a throttled route.
+    return min(12.0, 1.5 * (2 ** attempt)) + random.uniform(0.1, 0.6)
+
+
 class AIService:
+    _text_request_lock: Optional[asyncio.Lock] = None
+    _last_text_request_at = 0.0
+    _minimum_text_request_interval = 1.5
+
+    @classmethod
+    def _get_text_request_lock(cls) -> asyncio.Lock:
+        lock = cls._text_request_lock
+        if lock is None:
+            lock = asyncio.Lock()
+            cls._text_request_lock = lock
+        return lock
+
     def __init__(self):
         self.settings = get_settings()
 
@@ -45,18 +86,44 @@ class AIService:
                 "content": prompt
             })
 
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.post(
-                    f"{self.settings.ai_text_gateway_url}/chat/completions",
-                    json=payload,
-                    headers=headers
-                )
-                response.raise_for_status()
-                data = response.json()
-                return data["choices"][0]["message"]["content"]
+            async with self._get_text_request_lock():
+                async with httpx.AsyncClient(timeout=45) as client:
+                    for attempt in range(4):
+                        wait = self._minimum_text_request_interval - (
+                            time.monotonic() - type(self)._last_text_request_at
+                        )
+                        if wait > 0:
+                            await asyncio.sleep(wait)
+                        type(self)._last_text_request_at = time.monotonic()
+                        response = await client.post(
+                            f"{self.settings.ai_text_gateway_url}/chat/completions",
+                            json=payload,
+                            headers=headers
+                        )
+                        if _is_rate_limited_response(response) and attempt < 3:
+                            delay = _retry_delay(response, attempt)
+                            logger.warning(
+                                "AI text provider rate-limited request (attempt %s/4); retrying in %.1fs",
+                                attempt + 1,
+                                delay
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        if _is_rate_limited_response(response):
+                            raise httpx.HTTPStatusError(
+                                "AI provider rate limit exceeded after retries",
+                                request=response.request,
+                                response=response
+                            )
+                        response.raise_for_status()
+                        data = response.json()
+                        return data["choices"][0]["message"]["content"]
 
         except Exception as e:
-            logger.error(f"Error generating text: {e}")
+            if isinstance(e, httpx.HTTPStatusError) and _is_rate_limited_response(e.response):
+                logger.error("AI text provider remained rate-limited after retries")
+            else:
+                logger.error("Error generating text: %s", e)
             raise
 
     async def generate_image(
@@ -298,7 +365,10 @@ dangerous major objective), include it in quest_offers, and mention the offer in
 narrative. Return quest_completions only when the action clearly fulfills a recorded
 active quest; never award XP for merely accepting or discussing it.
 When reporting quest_completions, copy the exact stored NPC name and quest title.
-Do not narrate an attack as a hit; the game system resolves attacks against stored AC/HP.
+For combat actions, narrate the physical action naturally and vividly (for example,
+"Вы замахиваетесь и рубите гоблина по плечу"). Never mention "боевая система",
+"код", "механика разрешит", or promise what the roll will do. Do not decide or state
+whether it hit, missed, or how much damage it dealt; the game appends those facts below.
 Whenever an encountered creature exactly matches the supplied Open5e SRD creature catalog,
 include its exact key as open5e_key; do not make up a key. The bot will use that official
 creature's HP, AC, attack bonus, and damage dice instead of invented stats.
@@ -323,7 +393,7 @@ Use D&D exchange rates: 10 copper = 1 silver, 10 silver = 1 gold.
 Do not invent loot for ordinary actions. Never list items already in the character inventory."""
 
         prompt = f"""Player: {character_name}
-Current inventory: {inventory or []}
+Current inventory (authoritative item quantities; do not claim a different count): {inventory or []}
 Current purse: {currency or {"gold": 0, "silver": 0, "copper": 0}}
 Open5e item catalog (Russian display name [canonical DB name]):
 {item_catalog or "No imported item catalog."}
@@ -359,13 +429,40 @@ action explicitly and successfully changes it."""
                 "temperature": 0.8
             }
 
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.post(
-                    (settings.ai_text_gateway_url.rstrip("/") if settings.ai_text_gateway_url.rstrip("/").endswith("/chat/completions") else f"{settings.ai_text_gateway_url.rstrip('/')}/chat/completions"),
-                    json=payload,
-                    headers=headers
-                )
-                response.raise_for_status()
+            text_url = (
+                settings.ai_text_gateway_url.rstrip("/")
+                if settings.ai_text_gateway_url.rstrip("/").endswith("/chat/completions")
+                else f"{settings.ai_text_gateway_url.rstrip('/')}/chat/completions"
+            )
+            async with AIService._get_text_request_lock():
+                async with httpx.AsyncClient(timeout=45) as client:
+                    for attempt in range(4):
+                        wait = AIService._minimum_text_request_interval - (
+                            time.monotonic() - AIService._last_text_request_at
+                        )
+                        if wait > 0:
+                            await asyncio.sleep(wait)
+                        AIService._last_text_request_at = time.monotonic()
+                        response = await client.post(
+                            text_url,
+                            json=payload,
+                            headers=headers
+                        )
+                        if _is_rate_limited_response(response) and attempt < 3:
+                            delay = _retry_delay(response, attempt)
+                            logger.warning(
+                                "AI action request rate-limited (attempt %s/4); retrying in %.1fs",
+                                attempt + 1, delay
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        if _is_rate_limited_response(response):
+                            raise httpx.HTTPStatusError(
+                                "AI provider rate limit exceeded after retries",
+                                request=response.request,
+                                response=response
+                            )
+                        break
                 data = response.json()
                 content = data["choices"][0]["message"]["content"]
                 try:
@@ -487,9 +584,18 @@ action explicitly and successfully changes it."""
                     }
 
         except Exception as e:
-            logger.error(f"Error processing action: {e}")
+            if isinstance(e, httpx.HTTPStatusError) and _is_rate_limited_response(e.response):
+                logger.error("AI action provider remained rate-limited after retries")
+                failure_narrative = (
+                    "Сейчас ДМ перегружен. Ваше действие не было разрешено и не потратило "
+                    "ход; пожалуйста, отправьте его ещё раз через несколько секунд."
+                )
+            else:
+                logger.error(f"Error processing action: {e}")
+                failure_narrative = "ДМ на мгновение задумался и не смог разрешить действие."
             return {
-                "narrative": "ДМ на мгновение задумался и не смог разрешить действие.",
+                "narrative": failure_narrative,
+                "provider_error": isinstance(e, httpx.HTTPStatusError) and _is_rate_limited_response(e.response),
                 "loot": [],
                 "damage": 0,
                 "damage_dice": None,
