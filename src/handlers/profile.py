@@ -35,7 +35,8 @@ async def profile_command(message: types.Message):
 
         if not default_group:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🧙 Создать персонажа", callback_data="create_character")]
+                [InlineKeyboardButton(text="🧙 Создать персонажа", callback_data="create_character")],
+                [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]
             ])
             await message.answer(
                 "📋 У вас нет персонажа\n\n"
@@ -52,7 +53,8 @@ async def profile_command(message: types.Message):
 
         if not character:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🧙 Создать персонажа", callback_data="create_character")]
+                [InlineKeyboardButton(text="🧙 Создать персонажа", callback_data="create_character")],
+                [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]
             ])
             await message.answer(
                 "📋 У вас нет персонажа\n\n"
@@ -115,8 +117,8 @@ async def profile_command(message: types.Message):
             for row in inventory:
                 item = row["item"]
                 if item:
-                    equipped = "✓" if row["is_equipped"] else " "
-                    profile_text += f"\n[{equipped}] {item.name} x{row['quantity']}"
+                    marker = "✓" if row["is_equipped"] else "•"
+                    profile_text += f"\n{marker} {item.name} x{row['quantity']}"
         else:
             profile_text += "\nПуст"
 
@@ -134,15 +136,14 @@ async def profile_command(message: types.Message):
         if spells:
             profile_text += "\n\n<b>🔮 Заклинания:</b>"
             for spell in spells:
-                prepared = " ✓" if spell.is_prepared else ""
+                marker = "✓" if not (spell.slots_used or 0) else "•"
                 level = "заговор" if spell.spell_level == 0 else f"{spell.spell_level} ур."
-                profile_text += f"\n• {spell.spell_name} ({level}){prepared}"
+                profile_text += f"\n{marker} {spell.spell_name} ({level})"
 
         # Create action buttons
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🔄 Удалить персонажа", callback_data="delete_character")
-            ]
+            [InlineKeyboardButton(text="🔄 Удалить персонажа", callback_data="delete_character")],
+            [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]
         ])
 
         await message.answer(profile_text, reply_markup=keyboard)
@@ -246,10 +247,9 @@ async def show_abilities_callback(query: types.CallbackQuery):
         if spells:
             abilities_text += "\n\n<b>Заклинания:</b>\n"
             for spell in spells:
-                prepared = "✓" if spell.is_prepared else " "
+                marker = "✓" if not (spell.slots_used or 0) else "•"
                 abilities_text += (
-                    f"\n[{prepared}] <b>{spell.spell_name}</b> (Уровень {spell.spell_level})\n"
-                    f"    Слотов использовано: {spell.slots_used}\n"
+                    f"\n{marker} <b>{spell.spell_name}</b> (ур. {spell.spell_level})\n"
                 )
         else:
             if abilities:

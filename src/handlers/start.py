@@ -443,7 +443,8 @@ async def show_profile_callback(query: types.CallbackQuery):
             for entry in inventory:
                 item = entry["item"]
                 if item:
-                    profile_text += f"\n• {item.name} ×{entry['quantity']}"
+                    marker = "✓" if entry.get("is_equipped") else "•"
+                    profile_text += f"\n{marker} {item.name} ×{entry['quantity']}"
         else:
             profile_text += "\nПусто"
         if abilities:
@@ -460,7 +461,8 @@ async def show_profile_callback(query: types.CallbackQuery):
             profile_text += "\n\n<b>🔮 Заклинания:</b>"
             for spell in spells:
                 level = "заговор" if spell.spell_level == 0 else f"{spell.spell_level} ур."
-                profile_text += f"\n• {spell.spell_name} ({level})"
+                marker = "✓" if not (spell.slots_used or 0) else "•"
+                profile_text += f"\n{marker} {spell.spell_name} ({level})"
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]

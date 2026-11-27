@@ -234,6 +234,51 @@ def _entity_wound_description(entity: GameEntity) -> str:
     return "едва держится на ногах"
 
 
+def _action_check_ability(action: str) -> Optional[tuple[str, str]]:
+    """Map common D&D situations to an ability check; luck is only a last resort."""
+    text = action.casefold()
+    checks = (
+        ("сила", "сила", r"карабк|карабка|лез\w*|взбира\w*|поднима\w* по (?:верёвк|веревк)|"
+                            r"спуска\w* по (?:верёвк|веревк)|поднять|сломать|вырвать|удержать|толкнуть"),
+        ("ловкость", "акробатика", r"прыг\w*|кувырк|балансир|равновес|перепрыг|уклон\w*|"
+                                   r"проскольз|пролез\w*|ловк\w* движ"),
+        ("ловкость", "ловкость рук", r"карман|украст|спрятать предмет|ловкость рук|"
+                                   r"быстро доста|незаметно доста"),
+        ("ловкость", "скрытность", r"прокрасть|скрыт|тайно|незаметно|подкрасть"),
+        ("ловкость", "взлом или обезвреживание", r"обезвредить|вскрыть|замок|ловушк"),
+        ("телосложение", "выносливость", r"выдержать|вынослив|устал|изнур|долгий бег|"
+                                      r"долго плыв|терпеть боль|яд|болезн"),
+        ("мудрость", "внимательность", r"осмотр|осмотреть|огляд|заметить|внимани|прислуш|"
+                                      r"поиск|найти след|увидеть скрыт"),
+        ("мудрость", "проницательность", r"прочитать намерени|понять мотив|лож\w*|"
+                                      r"чувств\w* обман|проницатель"),
+        ("мудрость", "выживание", r"ориентир|след\w*|выжить в|развести костёр|найти еду|"
+                                 r"найти воду|охот\w*|погода|природ\w*"),
+        ("мудрость", "обращение с животными", r"успокоить животн|оседлать|дрессир|"
+                                             r"понять животн"),
+        ("интеллект", "понимание магии", r"разобраться в магии|понять маги|заклинани|"
+                                       r"магическ|расшифровать|руна|чар\w*"),
+        ("интеллект", "расследование", r"исследова|расследова|изучить механизм|"
+                                     r"найти улику|пазл|загадк|логическ"),
+        ("интеллект", "история или религия", r"вспомнить историю|историческ|древн\w*|"
+                                           r"религи|бог\w*|ритуал"),
+        ("харизма", "убеждение", r"убедить|уговорить|договор\w*|переговор"),
+        ("харизма", "обман", r"обмануть|солгать|ложн\w*|выдать себя за"),
+        ("харизма", "запугивание", r"запугать|угроз\w*|пригрозить"),
+        ("харизма", "выступление", r"сыграть роль|выступить|спеть|сыграть музыку|"
+                                  r"рассмешить|впечатлить публику"),
+    )
+    for ability, label, pattern in checks:
+        if re.search(pattern, text):
+            return ability, label
+    uncertain_action = re.search(
+        r"неизвест\w*|неожидан\w*|случайн\w*|на удачу|риск\w*|"
+        r"непонят\w*|неясн\w*|непредсказуем\w*|что произойд\w*",
+        text
+    )
+    return ("удача", "удача") if uncertain_action else None
+
+
 async def _send_generated_image(send_photo, prompt: str, caption: str) -> bool:
     """Generate an image and send it without failing the game turn on image errors."""
     try:
@@ -252,6 +297,7 @@ async def _send_generated_image(send_photo, prompt: str, caption: str) -> bool:
         else:
             image_bytes = base64.b64decode(image_result) if image_result else None
         if not image_bytes:
+            logger.warning("Scene image generation returned empty payload")
             return False
         image = BufferedInputFile(image_bytes, filename="scene.png")
         await send_photo(photo=image, caption=caption[:900])
@@ -805,7 +851,10 @@ async def inspect_entity_command(message: types.Message):
                 f"{html.escape(npc.current_location or 'Неизвестно')}\n\n"
                 f"Состояние: {status}, {visibility}\n\n"
                 f"<b>Задания:</b>\n{quest_text or 'Пока нет известных заданий.'}\n\n"
-                f"<b>Что вы о нём знаете:</b>\n{memory_text or 'Пока никаких особых фактов.'}"
+                f"<b>Что вы о нём знаете:</b>\n{memory_text or 'Пока никаких особых фактов.'}",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]
+                ])
             )
         elif npcs:
             lines = ["<b>Знакомые люди и существа:</b>"]
@@ -820,9 +869,19 @@ async def inspect_entity_command(message: types.Message):
                     f"{status}{', есть задание' if has_quest else ''}"
                 )
             lines.append("\nПодробнее: <code>/inspect имя</code>")
-            await message.answer("\n".join(lines))
+            await message.answer(
+                "\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]
+                ])
+            )
         else:
-            await message.answer("Вы пока не встречали людей или существ, которых можно осмотреть.")
+            await message.answer(
+                "Вы пока не встречали людей или существ, которых можно осмотреть.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]
+                ])
+            )
     except Exception:
         logger.exception("Failed to inspect entity")
         await message.answer("Не удалось осмотреть цель.")
@@ -1079,6 +1138,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
         campaign_npcs = db.query(CampaignNPC).filter(
             CampaignNPC.group_id == character.group_id
         ).order_by(CampaignNPC.last_seen_at.desc()).limit(30).all()
+        existing_npc_names = {npc.name.casefold() for npc in campaign_npcs}
         npc_context = []
         for npc in campaign_npcs:
             memories = db.query(NPCMemory).filter(
@@ -1123,9 +1183,55 @@ async def handle_action_description(message: types.Message, state: FSMContext):
             # Roll before the DM adjudicates the action so the result can affect
             # the narrative and consequences.
             is_declared_attack = _is_aggressive_action(action_description)
+            ability_check = _action_check_ability(action_description)
+            is_luck_check = ability_check is not None and ability_check[0] == "удача"
+            check_total = None
+            check_result = None
+            attributes = db.query(CharacterAttribute).filter(
+                CharacterAttribute.character_id == character.id
+            ).first()
+            ability_modifiers = {}
+            if attributes:
+                for key, field in (
+                    ("сила", "strength"), ("ловкость", "dexterity"),
+                    ("телосложение", "constitution"), ("интеллект", "intelligence"),
+                    ("мудрость", "wisdom"), ("харизма", "charisma")
+                ):
+                    ability_modifiers[key] = (int(getattr(attributes, field) or 10) - 10) // 2
+            proficiency_bonus = GameEngineService.calculate_proficiency_bonus(character.level)
+            if ability_check and not is_declared_attack:
+                ability_key, check_label = ability_check
+                ability_map = {
+                    "сила": "strength", "ловкость": "dexterity",
+                    "телосложение": "constitution", "интеллект": "intelligence",
+                    "мудрость": "wisdom", "харизма": "charisma",
+                }
+                modifier = 0
+                if attributes:
+                    if ability_key != "удача":
+                        score = getattr(attributes, ability_map.get(ability_key, ""), 10)
+                        modifier = (int(score or 10) - 10) // 2
+                        if ability_key in {
+                            "сила", "ловкость", "телосложение",
+                            "интеллект", "мудрость", "харизма"
+                        }:
+                            modifier += proficiency_bonus
+                d20_roll = GameEngineService.roll_d20()
+                check_total = d20_roll + modifier
+                if ability_key == "удача":
+                    check_result = (
+                        f"Проверка удачи (d20): выпало {d20_roll}. "
+                        "Оцени неизвестную ситуацию по результату: 1 — крайне плохо, "
+                        "20 — исключительно благоприятно."
+                    )
+                else:
+                    check_result = f"{check_label} ({ability_key}), итог {check_total}"
             # The combat resolver rolls its own attack die after target/range are known.
             # Do not feed the DM a misleading generic check roll for an attack.
-            d20_roll = None if is_declared_attack else GameEngineService.roll_d20()
+            if is_declared_attack:
+                d20_roll = None
+            elif not ability_check:
+                d20_roll = GameEngineService.roll_d20()
 
             # Call AI to get action result
             ai_result = await AIService.process_action(
@@ -1133,6 +1239,9 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 action_description=action_description,
                 world_setting=world_desc,
                 d20_roll=d20_roll,
+                check_result=check_result,
+                ability_modifiers=ability_modifiers,
+                proficiency_bonus=proficiency_bonus,
                 scene_state=scene_state,
                 recent_actions=recent_context,
                 known_entities=entity_context,
@@ -1214,6 +1323,23 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 else "look" if _is_looking_around(action_description)
                 else None
             )
+            new_npc_for_image = None
+            if isinstance(ai_result, dict):
+                for npc_data in ai_result.get("npcs", []):
+                    if not isinstance(npc_data, dict):
+                        continue
+                    npc_name = str(npc_data.get("name") or "").strip()
+                    if npc_name and npc_name.casefold() not in existing_npc_names:
+                        new_npc_for_image = npc_data
+                        break
+                if new_npc_for_image is None:
+                    for found_entity in ai_result.get("entities", []):
+                        if not isinstance(found_entity, dict) or found_entity.get("is_hostile"):
+                            continue
+                        npc_name = str(found_entity.get("name") or "").strip()
+                        if npc_name and npc_name.casefold() not in existing_npc_names:
+                            new_npc_for_image = found_entity
+                            break
             if arena_event_text:
                 narrative = f"{arena_event_text}\n\n{narrative}"
             for found_entity in ai_result.get("entities", []) if isinstance(ai_result, dict) else []:
@@ -1850,7 +1976,51 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         is_equipped=False,
                         slot=None
                     ))
+
+            consumed_report: list[str] = []
+            if isinstance(ai_result, dict):
+                for consumed in ai_result.get("consumed_items", []):
+                    if not isinstance(consumed, dict):
+                        continue
+                    cname = str(consumed.get("name", "")).strip()[:255]
+                    if not cname:
+                        continue
+                    try:
+                        cqty = max(1, min(int(consumed.get("quantity", 1)), 1000))
+                    except (TypeError, ValueError):
+                        cqty = 1
+                    item = db.query(Item).filter(Item.name.ilike(cname)).first()
+                    if item is None:
+                        # Try matching against inventory item names loosely.
+                        inv_rows = db.query(Inventory).join(Item).filter(
+                            Inventory.character_id == character.id,
+                            Item.name.ilike(f"%{cname}%")
+                        ).all()
+                        if inv_rows:
+                            item = inv_rows[0].item
+                    if item is None:
+                        continue
+                    rows = db.query(Inventory).filter(
+                        Inventory.character_id == character.id,
+                        Inventory.item_id == item.id
+                    ).order_by(Inventory.id).all()
+                    remaining = cqty
+                    for row in rows:
+                        if remaining <= 0:
+                            break
+                        take = min(max(0, row.quantity or 0), remaining)
+                        row.quantity = max(0, (row.quantity or 0) - take)
+                        remaining -= take
+                        if row.quantity <= 0 and not row.is_equipped:
+                            db.delete(row)
+                    consumed_qty = cqty - remaining
+                    if consumed_qty > 0:
+                        consumed_report.append(f"{item.name} x{consumed_qty}")
+
             db.commit()
+
+            if consumed_report:
+                narrative += "\n\n📦 <i>Потрачено: " + ", ".join(consumed_report) + "</i>"
 
             if homebrew_spell_warning:
                 narrative += homebrew_spell_warning
@@ -2076,6 +2246,14 @@ async def handle_action_description(message: types.Message, state: FSMContext):
             # Dice and target statistics stay internal; the DM narrative and
             # combat resolver communicate the outcome without exposing raw rolls.
             roll_text = ""
+            if ability_check and check_total is not None and d20_roll is not None:
+                ability_key = ability_check[0]
+                modifier = check_total - d20_roll
+                sign = "+" if modifier >= 0 else "−"
+                roll_text = (
+                    f"🎲 <b>Проверка: {ability_check[1]}</b> — "
+                    f"d20 ({d20_roll}) {sign} {abs(modifier)} = {check_total}\n\n"
+                )
 
             currency_note = ""
             currency_delta = ai_result.get("currency", {}) if isinstance(ai_result, dict) else {}
@@ -2142,6 +2320,24 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     "look": "🔎 Вид вокруг",
                 }[scene_image_kind]
                 await _send_generated_image(message.answer_photo, image_prompt, caption)
+            if new_npc_for_image:
+                npc_name = str(new_npc_for_image.get("name") or "Новый персонаж")
+                npc_description = str(
+                    new_npc_for_image.get("description")
+                    or new_npc_for_image.get("personality")
+                    or "Внешность персонажа описана в сцене."
+                )
+                npc_prompt = (
+                    f"Portrait of an NPC for a tabletop RPG. World and genre: {world_desc}. "
+                    f"Name: {npc_name}. Appearance and role: {npc_description[:1200]}. "
+                    "Show the character from the waist up, expressive face, clothing and "
+                    "distinctive physical features. No text, labels, lettering, or UI."
+                )
+                await _send_generated_image(
+                    message.answer_photo,
+                    npc_prompt,
+                    f"👤 {npc_name}"
+                )
             if character.current_hp <= 0:
                 if active_encounter:
                     active_encounter.is_active = False

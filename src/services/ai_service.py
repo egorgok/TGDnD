@@ -214,6 +214,12 @@ World Context: {world_context}
 Action: {action_description}
 
 Is this action possible? What are the consequences?"""
+        if proficiency_bonus:
+            prompt += f"\nБонус мастерства: +{proficiency_bonus}. Добавлять к проверкам характеристик."
+        if ability_modifiers:
+            prompt += f"\nМодификаторы характеристик (сила/dex/con/int/wis/cha): см. данные персонажа."
+        if determine_check_only:
+            prompt += "\nТолько определить, какая проверка нужна (или что событие происходит само)."
 
         try:
             response = await self.generate_text(prompt, system_prompt)
@@ -243,6 +249,9 @@ Is this action possible? What are the consequences?"""
         world_setting: str,
         inventory: Optional[list] = None,
         d20_roll: Optional[int] = None,
+        check_result: Optional[str] = None,
+        ability_modifiers: Optional[dict] = None,
+        proficiency_bonus: Optional[int] = None,
         scene_state: Optional[str] = None,
         recent_actions: Optional[list] = None,
         known_entities: Optional[list] = None,
@@ -271,6 +280,12 @@ genre unless the player explicitly changes the setting.
 Your role is to describe the consequences of player actions in an engaging, immersive way.
 Keep responses concise but vivid. Include sensory details.
 When describing combat outcomes, use D&D mechanics (advantage, disadvantage, etc.).
+Choose the most appropriate D&D ability check from the action and context: Strength for
+climbing, lifting, forcing, or endurance of physical force; Dexterity for acrobatics,
+stealth, sleight of hand, locks, and traps; Constitution for resisting exhaustion, poison,
+or prolonged strain; Intelligence for magic, investigation, history, religion, and logic;
+Wisdom for perception, insight, survival, and animals; Charisma for persuasion, deception,
+intimidation, or performance. Use a luck check only when no ability reasonably applies.
 Use the supplied Open5e SRD rules, spell descriptions, character features, and equipment
 as the source of truth for mechanics. Do not invent weapon/spell damage, armor values,
 spell effects, or fall damage. If the exact rule is not supplied, say what check is
@@ -279,9 +294,11 @@ Do not use remembered D&D rules as a source of mechanics. For creature statistic
 weapon properties, damage, spell range/effects, resistances, and saving throws, use only
 the supplied Open5e/API catalog or official stat block loaded from it. The application
 resolves stored/API-backed values; never substitute plausible-sounding remembered values.
-If no matching API record or supplied rule exists, do not invent numerical mechanics:
-narrate the uncertainty and ask for a matching source/rule or treat it as a non-mechanical
-fictional obstacle until authoritative data is available.
+If no matching API record or supplied rule exists, do not invent numerical mechanics.
+For uncertain RP situations where the exact mechanic is unknown (for example, unknown fall
+height, a trap of unclear severity, or a risky gamble), narrate the outcome based on the
+authoritative check_result (luck/ability) and describe plausible consequences. Do not
+output precise numeric mechanics from invented rules; the application handles luck checks.
 When the player explicitly uses or acquires an item absent from their inventory, include
 it in custom_items. If it exists in the supplied catalog, use its exact name and let the
 application load its API-backed properties. For an item absent from the API catalog, it
@@ -292,10 +309,13 @@ not official D&D/API rules. If the player wants to use an absent item as a weapo
 has not specified mechanics, ask for a catalog-equivalent weapon or treat the attempt as
 non-mechanical narration. Use only these item_type values: gear, weapon:melee,
 weapon:ranged, weapon:improvised, armor:light, armor:medium, armor:heavy, shield.
-Never invent custom spell rules for a vague request. A custom spell is only eligible
+ Never invent custom spell rules for a vague request. A custom spell is only eligible
 when the player supplies its level, casting time, range, duration, components, and
 complete effect/damage mechanics; those values remain explicitly player-authored rather
 than API rules.
+For crafting, only report consumed_items when the action explicitly crafts or uses a recipe
+and the materials are actually present in the authoritative inventory. Do not consume items
+for merely discussing a recipe. Include every actually spent material and its quantity.
 Return ONLY valid JSON with keys "narrative" (Russian text shown to the player)
 and "loot" (array of objects with name, type, rarity, description, quantity)
 and "damage" (integer HP damage to apply, 0 if there is no plausible injury)
@@ -309,6 +329,8 @@ and "entities" (array of newly encountered named people/creatures, each with nam
 entity_type, description, personality, is_hostile, distance_m, open5e_key if a hostile
 creature matches the supplied SRD catalog; for hostile creatures do not invent or return
 HP, AC, attack bonus, or damage dice—the application loads them from the API record)
+and "consumed_items" (array of objects with name and quantity for items consumed/spent by
+this action, such as crafting materials or used supplies; empty if none)
 and "custom_items" (explicitly used/acquired items absent from the character's inventory;
 each with Russian display name, catalog_name as exact canonical DB name if it exists or
 null if homebrew, item_type, damage_dice, damage_type, armor_class, range, description,
@@ -327,6 +349,11 @@ Put items in loot ONLY when the character actually finds/receives them in this a
 If your narrative says the character picks an item up, takes it, keeps it, or puts it
 in a bag/pocket, that item MUST be included in loot using its exact name.
 The d20 result is authoritative: 1 is a disastrous failure, 20 is an exceptional success.
+For a luck check, 1 means catastrophic outcome and 20 means exceptionally lucky outcome
+with minimal or no harm; scale consequences between them.
+When check_result is supplied, it is the authoritative total and check category; adjudicate
+the uncertain action from that total, not the raw d20 alone. Never replace an identified
+ability check with luck.
 For 2-19, judge whether the action succeeds based on difficulty and circumstances.
 If the supplied d20 result is null for an attack, do not resolve its success or failure;
 the game code will make a separate attack roll after validating target and range.
@@ -433,6 +460,9 @@ Open5e item catalog (Russian display name [canonical DB name]):
 {item_catalog or "No imported item catalog."}
 Action: {action_description}
 Player's d20 result: {d20_roll}
+Authoritative ability-check result: {check_result or "Not classified; use the supplied d20 only when a risky check is clearly required."}
+Character ability modifiers (before proficiency): {ability_modifiers or {}}
+Character proficiency bonus: +{proficiency_bonus if proficiency_bonus is not None else 0}
 Current scene state: {scene_state or "Not established yet; establish a plausible starting scene from the world setting."}
 Recent actions and outcomes: {recent_actions or []}
 Known entities and their current stats: {known_entities or []}
@@ -561,6 +591,10 @@ action explicitly and successfully changes it."""
                             item for item in result.get("custom_items", [])
                             if isinstance(item, dict) and str(item.get("name", "")).strip()
                         ] if isinstance(result.get("custom_items", []), list) else [],
+                        "consumed_items": [
+                            item for item in result.get("consumed_items", [])
+                            if isinstance(item, dict) and str(item.get("name", "")).strip()
+                        ] if isinstance(result.get("consumed_items", []), list) else [],
                         "weapon_name": str(result["weapon_name"]).strip()[:255]
                         if result.get("weapon_name") else None,
                         "custom_spells": [
@@ -607,6 +641,7 @@ action explicitly and successfully changes it."""
                         "location_changed": False,
                         "entities": [],
                         "custom_items": [],
+                        "consumed_items": [],
                         "weapon_name": None,
                         "custom_spells": [],
                         "target_name": None,
@@ -639,6 +674,7 @@ action explicitly and successfully changes it."""
                 "location_changed": False,
                 "entities": [],
                 "custom_items": [],
+                "consumed_items": [],
                 "weapon_name": None,
                 "custom_spells": [],
                 "target_name": None,
