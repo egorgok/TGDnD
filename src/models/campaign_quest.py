@@ -11,7 +11,8 @@ class CampaignQuest(Base):
 
     id = Column(Integer, primary_key=True)
     group_id = Column(BigInteger, ForeignKey("groups.id", ondelete="CASCADE"), nullable=False, index=True)
-    character_id = Column(Integer, ForeignKey("characters.id", ondelete="CASCADE"), nullable=False, index=True)
+    # NULL means this is a campaign-wide quest shared by all characters.
+    character_id = Column(Integer, ForeignKey("characters.id", ondelete="CASCADE"), nullable=True, index=True)
     npc_id = Column(Integer, ForeignKey("campaign_npcs.id", ondelete="CASCADE"), nullable=False, index=True)
     title = Column(String(255), nullable=False)
     description = Column(Text, nullable=False)

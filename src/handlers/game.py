@@ -28,6 +28,7 @@ import httpx
 import re
 import json
 import html
+import random
 from datetime import datetime
 from typing import Optional
 from io import BytesIO
@@ -103,6 +104,22 @@ def _grant_item_to_character(db: Session, character: Character, item_name: str, 
         db.add(inv)
     db.flush()
     return source_item, quantity
+
+
+def _credit_character_copper(db: Session, character: Character, copper_total: int) -> None:
+    purse = db.query(CharacterCurrency).filter(
+        CharacterCurrency.character_id == character.id
+    ).first()
+    if purse is None:
+        purse = CharacterCurrency(character_id=character.id)
+        db.add(purse)
+        db.flush()
+    total = (
+        (purse.gold or 0) * 100 + (purse.silver or 0) * 10
+        + (purse.copper or 0) + max(0, copper_total)
+    )
+    purse.gold, remainder = divmod(total, 100)
+    purse.silver, purse.copper = divmod(remainder, 10)
 
 
 def _apply_equipment_action(db: Session, character: Character, action: str) -> Optional[str]:
@@ -201,6 +218,10 @@ async def kirito_secret_command(message: types.Message):
             character.max_hp,
             1 if current_hp <= 0 else current_hp + 1,
         )
+        if character.current_hp > 0:
+            character.is_dead = False
+            character.death_successes = 0
+            character.death_failures = 0
         db.commit()
         await message.answer(
             f"✨ Секрет активирован. HP: {character.current_hp}/{character.max_hp}"
@@ -1304,7 +1325,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
             })
         active_quest_ids_at_start = [
             quest_id for (quest_id,) in db.query(CampaignQuest.id).filter(
-                CampaignQuest.character_id == character.id,
+                CampaignQuest.group_id == character.group_id,
                 CampaignQuest.status == "offered"
             ).all()
         ]
@@ -1459,6 +1480,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
             # Save AI-awarded loot silently; its narrative is shown as usual.
             narrative = ai_result.get("narrative", "") if isinstance(ai_result, dict) else str(ai_result)
             xp_earned = 0
+            group_xp_earned = 0
             quest_messages = []
             new_hostile_arrived = bool(
                 isinstance(ai_result, dict)
@@ -1692,7 +1714,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     ][:5]
                     db.add(CampaignQuest(
                         group_id=character.group_id,
-                        character_id=character.id,
+                        character_id=None,
                         npc_id=npc.id,
                         title=title,
                         description=description,
@@ -1729,7 +1751,6 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         CampaignNPC, CampaignNPC.id == CampaignQuest.npc_id
                     ).filter(
                         CampaignQuest.group_id == character.group_id,
-                        CampaignQuest.character_id == character.id,
                         CampaignQuest.id.in_(active_quest_ids_at_start),
                         CampaignQuest.status == "offered",
                         CampaignNPC.name.ilike(npc_name),
@@ -1739,54 +1760,65 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         continue
                     quest.status = "completed"
                     quest.completed_at = datetime.utcnow()
-                    xp_earned += quest.reward_xp
+                    group_xp_earned += quest.reward_xp
+                    group_characters = db.query(Character).filter(
+                        Character.group_id == character.group_id
+                    ).all()
                     reward_copper_total = (
                         (quest.reward_gold or 0) * 100
                         + (quest.reward_silver or 0) * 10
                         + (quest.reward_copper or 0)
                     )
                     if reward_copper_total:
-                        purse = db.query(CharacterCurrency).filter(
-                            CharacterCurrency.character_id == character.id
-                        ).first()
-                        if purse is None:
-                            purse = CharacterCurrency(character_id=character.id)
-                            db.add(purse)
-                        total = (
-                            (purse.gold or 0) * 100
-                            + (purse.silver or 0) * 10
-                            + (purse.copper or 0)
-                            + reward_copper_total
-                        )
-                        purse.gold, remainder = divmod(total, 100)
-                        purse.silver, purse.copper = divmod(remainder, 10)
+                        recipients = group_characters or [character]
+                        share, remainder = divmod(reward_copper_total, len(recipients))
+                        remainder_recipients = set(
+                            random.sample(range(len(recipients)), remainder)
+                        ) if remainder else set()
+                        for index, recipient in enumerate(recipients):
+                            _credit_character_copper(
+                                db,
+                                recipient,
+                                share + (1 if index in remainder_recipients else 0)
+                            )
+                    reward_recipient = random.choice(group_characters or [character])
+                    personal_rewards = []
                     for reward_item in quest.reward_items:
                         _grant_item_to_character(
                             db,
-                            character,
+                            reward_recipient,
                             reward_item.get("name"),
                             reward_item.get("quantity", 1),
                             reward_item.get("description"),
                         )
+                        personal_rewards.append(str(reward_item.get("name") or "предмет"))
                     for reward_spell in getattr(quest, "reward_spells", []) or []:
                         spell_name = str(reward_spell.get("name") or "").strip()[:255]
                         if not spell_name:
                             continue
                         exists = db.query(CharacterSpell.id).filter(
-                            CharacterSpell.character_id == character.id,
+                            CharacterSpell.character_id == reward_recipient.id,
                             CharacterSpell.spell_name.ilike(spell_name)
                         ).first()
                         if not exists:
                             db.add(CharacterSpell(
-                                character_id=character.id,
+                                character_id=reward_recipient.id,
                                 spell_name=spell_name,
                                 spell_level=_safe_int(reward_spell.get("level"), 1, 0, 9),
-                                slots_available=1,
                                 slots_used=0,
                             ))
+                            personal_rewards.append(spell_name)
+                    distribution_note = f"{quest.reward_xp} XP каждому участнику"
+                    if reward_copper_total:
+                        distribution_note += "; монеты разделены между группой"
                     quest_messages.append(
                         f"✅ Задание «{html.escape(quest.title)}» выполнено. "
-                        f"Получено {_quest_reward_text(quest)}."
+                        f"{distribution_note}. "
+                        + (
+                            f"Награды {', '.join(html.escape(name) for name in personal_rewards)} "
+                            f"достались {html.escape(reward_recipient.name)}."
+                            if personal_rewards else ""
+                        )
                     )
                 if quest_messages:
                     narrative += "\n\n" + "\n\n".join(quest_messages)
@@ -2271,7 +2303,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         f"Здоровье: {character.current_hp}/{character.max_hp}."
                     )
                 if not alive:
-                    damage_text += "\n☠️ Персонаж погиб. Дальнейшие действия невозможны."
+                    damage_text += "\n🩸 Персонаж повержен и нуждается в помощи союзника."
 
             enemy_attack_text = ""
             # A player action is one combat round: after it resolves, every living
@@ -2400,6 +2432,12 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     + "\n".join(f"• {line}" for line in enemy_lines)
                     + f"\nВаше HP: {character.current_hp}/{character.max_hp}."
                 )
+            if character.current_hp <= 0 and not character.is_dead:
+                narrative += (
+                    "\n\n🩸 Персонаж при смерти. Союзник может бросить спасбросок: "
+                    f"<code>/deathsave {character.name}</code>. "
+                    "Три успеха поднимут его с 1 HP, три неудачи приведут к смерти."
+                )
             if enemy_turn_due and active_game_session:
                 active_game_session.combat_active = bool(
                     db.query(CombatEncounter.id).join(
@@ -2442,6 +2480,25 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     if unlocked_features:
                         progression_note += "\nОткрыты особенности: " + ", ".join(unlocked_features) + "."
                 narrative += progression_note
+            if group_xp_earned > 0:
+                party_lines = []
+                party = db.query(Character).filter(
+                    Character.group_id == character.group_id
+                ).all()
+                for party_character in party:
+                    granted_xp, reached_levels, unlocked_features = add_experience(
+                        db, party_character, group_xp_earned
+                    )
+                    line = f"• {party_character.name}: +{granted_xp} XP"
+                    if reached_levels:
+                        line += f", новый уровень {party_character.level}"
+                        if unlocked_features:
+                            line += "; открыто: " + ", ".join(unlocked_features)
+                    party_lines.append(line)
+                narrative += (
+                    "\n\n🎉 <b>Опыт за групповое задание получили все участники:</b>\n"
+                    + "\n".join(party_lines)
+                )
 
             new_scene_state = ai_result.get("scene_state", "") if isinstance(ai_result, dict) else ""
 
@@ -2562,11 +2619,17 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     f"👤 {npc_name}"
                 )
             if character.current_hp <= 0:
-                if active_encounter:
-                    active_encounter.is_active = False
-                if active_game_session:
-                    active_game_session.combat_active = False
-                    active_game_session.turn_order = None
+                living_party_members = db.query(Character.id).filter(
+                    Character.group_id == character.group_id,
+                    Character.current_hp > 0,
+                    Character.is_dead.is_(False)
+                ).count()
+                if not living_party_members:
+                    if active_encounter:
+                        active_encounter.is_active = False
+                    if active_game_session:
+                        active_game_session.combat_active = False
+                        active_game_session.turn_order = None
                 db.commit()
                 await state.clear()
             elif active_encounter and active_encounter.is_active:
@@ -3042,6 +3105,165 @@ async def inventory_command(message: types.Message):
         db.close()
 
 
+@router.message(Command("send"))
+async def send_currency_command(message: types.Message):
+    """Transfer coins to another character in the same campaign."""
+    db: Session = SessionLocal()
+    try:
+        group = resolve_group(db, message.from_user.id, message.chat)
+        sender = resolve_character(db, message.from_user.id, message.chat)
+        if not group or not sender:
+            await message.answer("Сначала создайте персонажа в этом сеттинге.")
+            return
+        parts = (message.text or "").split(maxsplit=3)
+        if len(parts) < 4:
+            await message.answer("Формат: /send [количество] [зм/см/мм] [имя персонажа]")
+            return
+        try:
+            amount = int(parts[1])
+        except ValueError:
+            await message.answer("Количество монет должно быть целым числом.")
+            return
+        if amount <= 0:
+            await message.answer("Можно передать только положительное количество монет.")
+            return
+
+        denomination = parts[2].casefold()
+        coin_values = {
+            "зм": ("gold", 100), "золотых": ("gold", 100), "золотые": ("gold", 100),
+            "см": ("silver", 10), "серебряных": ("silver", 10), "серебряные": ("silver", 10),
+            "мм": ("copper", 1), "медных": ("copper", 1), "медные": ("copper", 1),
+        }
+        if denomination not in coin_values:
+            await message.answer("Укажите номинал: зм, см или мм.")
+            return
+        coin_field, copper_value = coin_values[denomination]
+        recipient_name = parts[3].strip().strip("\"'«»")
+        matches = db.query(Character).filter(
+            Character.group_id == group.id,
+            Character.name.ilike(recipient_name)
+        ).all()
+        if len(matches) != 1:
+            await message.answer(
+                "Персонаж с таким именем не найден в этом сеттинге "
+                "или имя неоднозначно."
+            )
+            return
+        recipient = matches[0]
+        if recipient.id == sender.id:
+            await message.answer("Нельзя передать монеты самому себе.")
+            return
+
+        sender_purse = db.query(CharacterCurrency).filter(
+            CharacterCurrency.character_id == sender.id
+        ).first()
+        if not sender_purse:
+            await message.answer("В вашем кошельке нет монет.")
+            return
+        balance = (
+            (sender_purse.gold or 0) * 100
+            + (sender_purse.silver or 0) * 10
+            + (sender_purse.copper or 0)
+        )
+        transfer_total = amount * copper_value
+        if balance < transfer_total:
+            await message.answer("Недостаточно монет для перевода.")
+            return
+        balance -= transfer_total
+        sender_purse.gold, remainder = divmod(balance, 100)
+        sender_purse.silver, sender_purse.copper = divmod(remainder, 10)
+        _credit_character_copper(db, recipient, transfer_total)
+        db.commit()
+        await message.answer(
+            f"💸 {html.escape(sender.name)} передал {amount} {denomination} "
+            f"персонажу {html.escape(recipient.name)}."
+        )
+    except Exception:
+        db.rollback()
+        logger.exception("Currency transfer failed")
+        await message.answer("Не удалось перевести монеты.")
+    finally:
+        db.close()
+
+
+@router.message(Command("deathsave"))
+async def death_save_command(message: types.Message):
+    """An ally rolls a downed character's death save; three failures mean death."""
+    db: Session = SessionLocal()
+    try:
+        group = resolve_group(db, message.from_user.id, message.chat)
+        actor = resolve_character(db, message.from_user.id, message.chat)
+        if not group or not actor:
+            await message.answer("Сначала создайте персонажа в этом сеттинге.")
+            return
+
+        requested_name = (message.text or "").partition(" ")[2].strip().strip("\"'«»")
+        if requested_name:
+            candidates = db.query(Character).filter(
+                Character.group_id == group.id,
+                Character.name.ilike(requested_name)
+            ).all()
+            if not candidates:
+                candidates = db.query(Character).filter(
+                    Character.group_id == group.id,
+                    Character.name.ilike(f"%{requested_name}%")
+                ).all()
+        else:
+            candidates = [actor]
+
+        if len(candidates) != 1:
+            await message.answer(
+                "Укажите имя персонажа с 0 HP: /deathsave [имя персонажа]"
+            )
+            return
+        target = candidates[0]
+        if target.is_dead:
+            await message.answer(f"☠️ {html.escape(target.name)} уже погиб.")
+            return
+        if target.current_hp > 0:
+            await message.answer(f"У {html.escape(target.name)} больше нет нужды в спасброске.")
+            return
+
+        roll = GameEngineService.roll_d20()
+        if roll == 20:
+            target.current_hp = 1
+            target.death_successes = 0
+            target.death_failures = 0
+            result = "Критический успех! Персонаж приходит в себя с 1 HP."
+        else:
+            if roll == 1:
+                target.death_failures = min(3, (target.death_failures or 0) + 2)
+            elif roll >= 10:
+                target.death_successes = min(3, (target.death_successes or 0) + 1)
+            else:
+                target.death_failures = min(3, (target.death_failures or 0) + 1)
+
+            if target.death_failures >= 3:
+                target.is_dead = True
+                result = "Третья неудача. Персонаж погиб."
+            elif target.death_successes >= 3:
+                target.current_hp = 1
+                target.death_successes = 0
+                target.death_failures = 0
+                result = "Три успеха! Союзник стабилизирует и поднимает персонажа с 1 HP."
+            else:
+                result = (
+                    f"Успехи: {target.death_successes}/3; "
+                    f"неудачи: {target.death_failures}/3."
+                )
+        db.commit()
+        await message.answer(
+            f"🎲 {html.escape(actor.name)} делает спасбросок за "
+            f"{html.escape(target.name)}: d20 = {roll}.\n{result}"
+        )
+    except Exception:
+        db.rollback()
+        logger.exception("Death save failed")
+        await message.answer("Не удалось выполнить спасбросок.")
+    finally:
+        db.close()
+
+
 @router.message(Command("help"))
 async def help_command(message: types.Message):
     """Show help with available commands"""
@@ -3052,6 +3274,8 @@ async def help_command(message: types.Message):
 /create_character - Создать нового персонажа
 /profile - Показать профиль персонажа
 /inventory - Показать инвентарь
+/send [количество] [зм/см/мм] [имя] - Передать монеты союзнику
+/deathsave [имя] - Сделать спасбросок за персонажа с 0 HP
 /equip <номер> - Экипировать предмет (по номеру из /inventory)
 /unequip <номер> - Снять предмет (по номеру из /inventory)
 /inspect [имя] - Осмотреть встреченного человека или существо

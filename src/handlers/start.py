@@ -756,7 +756,11 @@ async def show_profile_callback(query: types.CallbackQuery):
             purse = CharacterCurrency(character_id=character.id)
             db.add(purse)
             db.commit()
-        hp_status = "☠️ Погиб" if character.current_hp <= 0 else "❤️ Здоровье"
+        hp_status = (
+            "☠️ Погиб" if character.is_dead
+            else "🩸 При смерти" if character.current_hp <= 0
+            else "❤️ Здоровье"
+        )
 
         profile_text = f"""
 <b>⚔️ {character.name}</b>

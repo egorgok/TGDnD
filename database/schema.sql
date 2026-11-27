@@ -62,6 +62,9 @@ CREATE TABLE IF NOT EXISTS characters (
     max_hp INT NOT NULL,
     current_hp INT NOT NULL,
     experience INT DEFAULT 0,
+    death_successes INT NOT NULL DEFAULT 0,
+    death_failures INT NOT NULL DEFAULT 0,
+    is_dead BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -282,7 +285,7 @@ CREATE TABLE IF NOT EXISTS combat_participants (
 CREATE TABLE IF NOT EXISTS campaign_quests (
     id SERIAL PRIMARY KEY,
     group_id BIGINT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-    character_id INT NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    character_id INT REFERENCES characters(id) ON DELETE CASCADE,
     npc_id INT NOT NULL REFERENCES campaign_npcs(id) ON DELETE CASCADE,
     title VARCHAR(255) NOT NULL,
     description TEXT NOT NULL,

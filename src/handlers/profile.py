@@ -88,7 +88,7 @@ async def profile_command(message: types.Message):
 Уровень: {character.level}
 Опыт: {character.experience or 0}{f" / {xp_target}" if xp_target else " (максимум)"}
 
-<b>❤️ Здоровье:</b>
+<b>{'☠️ Погиб' if character.is_dead else '🩸 При смерти' if character.current_hp <= 0 else '❤️ Здоровье'}:</b>
 {character.current_hp}/{character.max_hp} HP
 <b>🛡️ Класс защиты:</b> {armor_class}
 <b>💰 Кошелёк:</b> {purse.gold} зм · {purse.silver} см · {purse.copper} мм

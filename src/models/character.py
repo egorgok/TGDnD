@@ -15,6 +15,9 @@ class Character(Base):
     max_hp = Column(Integer, nullable=False)
     current_hp = Column(Integer, nullable=False)
     experience = Column(Integer, default=0)
+    death_successes = Column(Integer, nullable=False, default=0)
+    death_failures = Column(Integer, nullable=False, default=0)
+    is_dead = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 

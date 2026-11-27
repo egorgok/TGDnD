@@ -413,8 +413,11 @@ already recorded. Keep quests concrete, achievable, and tied to the NPC and sett
 Offer reasonable XP (usually 50-300 for a modest local task, more only for a genuinely
 dangerous major objective), include it in quest_offers, and mention the offer in the
 narrative. You may also include small quest rewards in coins (reward_gold/reward_silver/
-reward_copper) and/or items (reward_items: list of dicts with name, quantity, optional
-description) when appropriate. Return quest_completions only when the action clearly fulfills a recorded
+reward_copper), items (reward_items: list of dicts with name, quantity, optional
+description), or spells (reward_spells: list of dicts with name and level). Group quests
+are shared by every character in the campaign; the app splits coin value among the party
+and grants each item or spell reward to one randomly chosen member. Return quest_completions
+only when the action clearly fulfills a recorded
 active quest; never award XP or rewards for merely accepting or discussing it.
 When reporting quest_completions, copy the exact stored NPC name and quest title.
 Quest continuity is mandatory: once an NPC gives the player a quest, that quest giver

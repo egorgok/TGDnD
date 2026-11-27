@@ -45,6 +45,17 @@ class DnDBot:
                 conn.exec_driver_sql(
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS active_group_id BIGINT"
                 )
+                for column, col_type in (
+                    ("death_successes", "INTEGER NOT NULL DEFAULT 0"),
+                    ("death_failures", "INTEGER NOT NULL DEFAULT 0"),
+                    ("is_dead", "BOOLEAN NOT NULL DEFAULT FALSE"),
+                ):
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE characters ADD COLUMN IF NOT EXISTS {column} {col_type}"
+                    )
+                conn.exec_driver_sql(
+                    "ALTER TABLE campaign_quests ALTER COLUMN character_id DROP NOT NULL"
+                )
                 conn.exec_driver_sql(
                     """
                     DO $$
@@ -128,6 +139,8 @@ class DnDBot:
             BotCommand(command="location", description="Показать текущую локацию"),
             BotCommand(command="travel", description="Путешествовать"),
             BotCommand(command="inventory", description="Показать инвентарь"),
+            BotCommand(command="send", description="Передать монеты союзнику"),
+            BotCommand(command="deathsave", description="Спасбросок за павшего союзника"),
             BotCommand(command="help", description="Помощь"),
         ]
         try:
