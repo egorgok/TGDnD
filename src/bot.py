@@ -1,6 +1,9 @@
 import logging
 import asyncio
 from aiogram import Bot, Dispatcher, types
+from aiogram.types import (
+    BotCommand, BotCommandScopeAllGroupChats
+)
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -36,12 +39,33 @@ class DnDBot:
                     ("reward_items_json", "TEXT"),
                     ("reward_spells_json", "TEXT"),
                 ):
-                    try:
-                        conn.exec_driver_sql(
-                            f"ALTER TABLE campaign_quests ADD COLUMN {column} {col_type}"
-                        )
-                    except Exception:
-                        pass
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE campaign_quests ADD COLUMN IF NOT EXISTS {column} {col_type}"
+                    )
+                conn.exec_driver_sql(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS active_group_id BIGINT"
+                )
+                conn.exec_driver_sql(
+                    """
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1
+                            FROM pg_constraint c
+                            JOIN pg_attribute a ON a.attrelid = c.conrelid
+                            WHERE c.conrelid = 'users'::regclass
+                              AND c.contype = 'f'
+                              AND a.attname = 'active_group_id'
+                              AND a.attnum = ANY(c.conkey)
+                        ) THEN
+                            ALTER TABLE users
+                            ADD CONSTRAINT fk_users_active_group
+                            FOREIGN KEY (active_group_id)
+                            REFERENCES groups(id) ON DELETE SET NULL;
+                        END IF;
+                    END $$;
+                    """
+                )
             logger.info("Database tables created successfully")
         except Exception as e:
             logger.error(f"Error initializing database: {e}")
@@ -97,6 +121,23 @@ class DnDBot:
         """Run on bot startup"""
         logger.info("Bot starting up...")
         await self.init_db()
+        group_commands = [
+            BotCommand(command="action", description="Совершить действие персонажа"),
+            BotCommand(command="profile", description="Показать профиль персонажа"),
+            BotCommand(command="inspect", description="Осмотреть знакомого NPC"),
+            BotCommand(command="location", description="Показать текущую локацию"),
+            BotCommand(command="travel", description="Путешествовать"),
+            BotCommand(command="inventory", description="Показать инвентарь"),
+            BotCommand(command="help", description="Помощь"),
+        ]
+        try:
+            await self.bot.set_my_commands(
+                group_commands,
+                scope=BotCommandScopeAllGroupChats()
+            )
+            logger.info("Group chat commands registered")
+        except Exception:
+            logger.exception("Could not register group chat command menu")
         logger.info("Bot ready!")
 
     async def on_shutdown(self):

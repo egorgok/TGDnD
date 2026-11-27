@@ -26,6 +26,69 @@ class GroupJoinStates(StatesGroup):
     entering_code = State()
 
 
+@router.my_chat_member(F.chat.type.in_(["group", "supergroup"]))
+async def bot_membership_changed(update: types.ChatMemberUpdated):
+    """Remove a campaign from every user's selector when its Telegram group disappears."""
+    new_status = update.new_chat_member.status
+    db: Session = SessionLocal()
+    try:
+        if new_status in {"member", "administrator"}:
+            group = db.query(Group).filter(Group.id == update.chat.id).first()
+            if group is None:
+                group = Group(
+                    id=update.chat.id,
+                    title=update.chat.title or "Групповой сеттинг",
+                    group_type="campaign",
+                    gm_prompt="Групповая кампания",
+                    world_description=None,
+                )
+                db.add(group)
+                db.flush()
+            # The user who added the bot is an initial campaign member.
+            user_id = update.from_user.id if update.from_user else None
+            if user_id:
+                user = db.query(User).filter(User.id == user_id).first()
+                if user is None:
+                    user = User(id=user_id, username=update.from_user.username,
+                                full_name=update.from_user.full_name)
+                    db.add(user)
+                    db.flush()
+                if not db.query(GroupMember.id).filter(
+                    GroupMember.group_id == group.id,
+                    GroupMember.user_id == user_id
+                ).first():
+                    db.add(GroupMember(group_id=group.id, user_id=user_id, role="gm"))
+            db.commit()
+            logger.info("Registered Telegram campaign %s (%s)", update.chat.id, group.title)
+            return
+
+        if new_status not in {"left", "kicked"}:
+            return
+
+        group = db.query(Group).filter(Group.id == update.chat.id).first()
+        if not group:
+            return
+
+        # Explicitly clear active selectors; database FK ON DELETE SET NULL is
+        # also configured, but this keeps legacy databases safe.
+        db.query(User).filter(User.active_group_id == group.id).update(
+            {User.active_group_id: None},
+            synchronize_session=False
+        )
+        db.delete(group)
+        db.commit()
+        logger.info(
+            "Removed campaign %s (%s) after bot left Telegram chat",
+            update.chat.id,
+            update.chat.title
+        )
+    except Exception:
+        db.rollback()
+        logger.exception("Could not remove campaign after bot was removed from chat")
+    finally:
+        db.close()
+
+
 @router.message(F.chat.type.in_(["group", "supergroup"]))
 async def group_message_handler(message: types.Message, state: FSMContext):
     """Handle messages in group chats"""
@@ -33,12 +96,86 @@ async def group_message_handler(message: types.Message, state: FSMContext):
     if message.new_chat_members:
         for member in message.new_chat_members:
             if member.is_bot:
+                db: Session = SessionLocal()
+                try:
+                    group = db.query(Group).filter(Group.id == message.chat.id).first()
+                    if group is None:
+                        group = Group(
+                            id=message.chat.id,
+                            title=message.chat.title or "Групповой сеттинг",
+                            group_type="campaign",
+                            gm_prompt="Групповая кампания",
+                            world_description=None,
+                        )
+                        db.add(group)
+                        db.flush()
+                    creator = db.query(User).filter(
+                        User.id == message.from_user.id
+                    ).first()
+                    if creator is None:
+                        creator = User(
+                            id=message.from_user.id,
+                            username=message.from_user.username,
+                            full_name=message.from_user.full_name,
+                        )
+                        db.add(creator)
+                        db.flush()
+                    if not db.query(GroupMember).filter(
+                        GroupMember.group_id == group.id,
+                        GroupMember.user_id == creator.id
+                    ).first():
+                        db.add(GroupMember(
+                            group_id=group.id,
+                            user_id=creator.id,
+                            role="gm"
+                        ))
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    logger.exception("Failed to register Telegram group campaign")
+                finally:
+                    db.close()
                 await message.answer(
                     "🗺️ <b>Добро пожаловать в D&D RPG Bot!</b>\n\n"
-                    "Я готов помочь вам провести эпическую кампанию!\n\n"
-                    "Используйте /setup_campaign для настройки кампании в этом чате"
+                    "Этот чат зарегистрирован как групповой сеттинг.\n"
+                    "Откройте личный чат с ботом и выберите его в меню. "
+                    "Первый игрок задаст описание мира.\n\n"
+                    "Для ручной настройки также доступна команда /setup_campaign"
                 )
                 break
+
+    # Telegram sends this event when a new participant joins the chat.
+    for member in message.new_chat_members or []:
+        if member.is_bot:
+            continue
+        db: Session = SessionLocal()
+        try:
+            group = db.query(Group).filter(Group.id == message.chat.id).first()
+            if group:
+                user = db.query(User).filter(User.id == member.id).first()
+                if user is None:
+                    user = User(
+                        id=member.id,
+                        username=member.username,
+                        full_name=member.full_name,
+                    )
+                    db.add(user)
+                    db.flush()
+                if not db.query(GroupMember).filter(
+                    GroupMember.group_id == group.id,
+                    GroupMember.user_id == member.id
+                ).first():
+                    db.add(GroupMember(
+                        group_id=group.id,
+                        user_id=member.id,
+                        role="player"
+                    ))
+                db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to register new Telegram group member")
+        finally:
+            db.close()
 
 
 @router.message(Command("setup_campaign"))

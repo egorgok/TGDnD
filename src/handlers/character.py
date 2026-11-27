@@ -77,6 +77,32 @@ def get_or_create_default_group(db: Session, user_id: int) -> Group:
 
 @router.callback_query(F.data == "create_character")
 async def create_character_callback(query: types.CallbackQuery, state: FSMContext):
+    db: Session = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == query.from_user.id).first()
+        if user and user.active_group_id:
+            membership = db.query(GroupMember).filter(
+                GroupMember.group_id == user.active_group_id,
+                GroupMember.user_id == user.id
+            ).first()
+            if membership:
+                await state.update_data(group_id=user.active_group_id)
+    finally:
+        db.close()
+    await query.answer()
+    msg = query.message.model_copy(update={"from_user": query.from_user})
+    await create_character_command(msg, state)
+
+
+@router.callback_query(F.data.startswith("create_character_group_"))
+async def create_group_character_callback(query: types.CallbackQuery, state: FSMContext):
+    """Start character creation inside the selected shared campaign."""
+    try:
+        group_id = int(query.data.removeprefix("create_character_group_"))
+    except ValueError:
+        await query.answer("Некорректная группа.", show_alert=True)
+        return
+    await state.update_data(group_id=group_id)
     await query.answer()
     msg = query.message.model_copy(update={"from_user": query.from_user})
     await create_character_command(msg, state)
@@ -97,8 +123,27 @@ async def create_character_command(message: types.Message, state: FSMContext):
             db.add(user)
             db.commit()
 
-        # Get or create personal group
-        group = get_or_create_default_group(db, message.from_user.id)
+        # Use a preselected shared campaign when creation was opened from
+        # the setting selector; otherwise use the personal campaign.
+        state_data = await state.get_data()
+        selected_group_id = state_data.get("group_id")
+        current_user = db.query(User).filter(User.id == message.from_user.id).first()
+        if not selected_group_id and current_user and current_user.active_group_id:
+            active_membership = db.query(GroupMember).filter(
+                GroupMember.group_id == current_user.active_group_id,
+                GroupMember.user_id == current_user.id
+            ).first()
+            if active_membership:
+                selected_group_id = current_user.active_group_id
+        group = None
+        if selected_group_id:
+            group = db.query(Group).join(GroupMember).filter(
+                Group.id == selected_group_id,
+                GroupMember.group_id == selected_group_id,
+                GroupMember.user_id == message.from_user.id
+            ).first()
+        if group is None:
+            group = get_or_create_default_group(db, message.from_user.id)
 
         # Get available races
         races = RulesService.get_all_races()
@@ -320,6 +365,28 @@ async def confirm_create_callback(query: types.CallbackQuery, state: FSMContext)
         race = data.get("race")
         class_name = data.get("class_")
         attributes = data.get("attributes")
+        selected_group_id = data.get("group_id")
+
+        if not selected_group_id:
+            await query.message.edit_text(
+                format_error("Сеттинг потерян. Вернитесь в меню и выберите сеттинг заново.")
+            )
+            await state.clear()
+            await query.answer()
+            return
+
+        membership = db.query(GroupMember).filter(
+            GroupMember.group_id == selected_group_id,
+            GroupMember.user_id == query.from_user.id
+        ).first()
+        selected_group = db.query(Group).filter(Group.id == selected_group_id).first()
+        if not membership or not selected_group:
+            await query.message.edit_text(
+                format_error("Вы больше не состоите в выбранном сеттинге.")
+            )
+            await state.clear()
+            await query.answer()
+            return
 
         if not open5e_class_is_available(db, class_name):
             await query.message.edit_text(
@@ -334,11 +401,10 @@ async def confirm_create_callback(query: types.CallbackQuery, state: FSMContext)
         con_modifier = (attributes["con"] - 10) // 2
         starting_hp = class_info["starting_hp"] + con_modifier
 
-        # Create character with user_id as group_id (dummy group for solo play)
         character = CharacterService.create_character(
             db=db,
             user_id=query.from_user.id,
-            group_id=query.from_user.id,  # Use user_id as group_id for solo play
+            group_id=selected_group_id,
             name=name,
             race=race,
             class_=class_name,
@@ -347,6 +413,10 @@ async def confirm_create_callback(query: types.CallbackQuery, state: FSMContext)
         )
 
         if character:
+            user = db.query(User).filter(User.id == query.from_user.id).first()
+            if user:
+                user.active_group_id = selected_group_id
+                db.commit()
             starting_data = grant_starting_class_data(db, character)
             await query.message.edit_text(
                 format_success(f"✅ Персонаж {name} создан успешно!\n\n")

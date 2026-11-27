@@ -8,7 +8,7 @@ from src.models.base import SessionLocal
 from src.models import (
     User, Character, CharacterAttribute, CharacterAbility, CharacterSpell,
     Inventory, Item, Group, GroupMember,
-    ActionHistory, GameSession, CombatEncounter, CampaignNPC, CharacterCurrency
+    ActionHistory, GameSession, CombatEncounter, CampaignNPC, CharacterCurrency, Location
 )
 from src.services import RulesService, GameEngineService
 from src.services.character_service import xp_for_next_level
@@ -22,15 +22,112 @@ router = Router()
 
 class MenuStates(StatesGroup):
     entering_setting_style = State()
+    entering_group_setting_style = State()
 
 
-def main_menu_keyboard():
+def get_or_create_personal_group(db: Session, user_id: int) -> Group:
+    group = db.query(Group).filter(Group.id == user_id).first()
+    if group:
+        if not group.group_type:
+            group.group_type = "personal"
+        if not group.world_description:
+            group.world_description = (
+                "Классическое средневековое фэнтези: королевства, деревни, замки, "
+                "дороги, мечи, луки и магия. Сохраняй средневековый уровень "
+                "технологий; не вводи современную технику или научную фантастику, "
+                "если игрок явно не пересобрал сеттинг."
+            )
+        member = db.query(GroupMember).filter(
+            GroupMember.group_id == group.id,
+            GroupMember.user_id == user_id
+        ).first()
+        if not member:
+            db.add(GroupMember(group_id=group.id, user_id=user_id, role="gm"))
+        db.commit()
+        return group
+
+    group = Group(
+        id=user_id,
+        title="Персональная кампания",
+        group_type="personal",
+        gm_prompt="Одиночная кампания",
+        world_description=(
+            "Классическое средневековое фэнтези: королевства, деревни, замки, "
+            "дороги, мечи, луки и магия. Сохраняй исторический средневековый "
+            "уровень технологий; не вводи современную технику или научную "
+            "фантастику, если игрок явно не пересобрал сеттинг."
+        )
+    )
+    db.add(group)
+    db.flush()
+    db.add(GroupMember(group_id=user_id, user_id=user_id, role="gm"))
+    db.commit()
+    return group
+
+
+def get_active_group(db: Session, user: User) -> Group | None:
+    if user.active_group_id:
+        group = db.query(Group).filter(Group.id == user.active_group_id).first()
+        if group:
+            is_member = db.query(GroupMember).filter(
+                GroupMember.group_id == group.id,
+                GroupMember.user_id == user.id
+            ).first()
+            if is_member:
+                return group
+    return None
+
+
+def ensure_campaign_start(db: Session, group: Group) -> None:
+    """Create the shared initial location/session for newly registered Telegram groups."""
+    session = db.query(GameSession).filter(GameSession.group_id == group.id).first()
+    if session and session.current_location_id:
+        return
+    location = db.query(Location).filter(Location.group_id == group.id).order_by(Location.id).first()
+    if not location:
+        location = Location(
+            group_id=group.id,
+            name="Начало приключения",
+            description=(
+                f"Вы начинаете приключение в мире «{group.title}». "
+                "Опишите действие, чтобы исследовать мир."
+            ),
+            location_type="starting"
+        )
+        db.add(location)
+        db.flush()
+    if not session:
+        session = GameSession(
+            group_id=group.id,
+            current_location_id=location.id,
+            is_active=True,
+            combat_active=False
+        )
+        db.add(session)
+    else:
+        session.current_location_id = location.id
+
+
+def setting_selection_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Соло игра", callback_data="setting_solo")],
+        [InlineKeyboardButton(text="👥 Групповая игра", callback_data="setting_group_list")],
+    ])
+
+
+def setting_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👤 Профиль", callback_data="menu_profile")],
         [InlineKeyboardButton(text="⚔️ Действие", callback_data="menu_action")],
         [InlineKeyboardButton(text="👥 Знакомые", callback_data="menu_acquaintances")],
         [InlineKeyboardButton(text="🌍 Пересобрать сеттинг", callback_data="reset_setting")],
+        [InlineKeyboardButton(text="↩️ Вернуться к выбору", callback_data="setting_select")],
     ])
+
+
+def main_menu_keyboard():
+    """Backward-compatible alias for in-setting menu."""
+    return setting_menu_keyboard()
 
 
 @router.message(Command("start"))
@@ -50,13 +147,20 @@ async def start_command(message: types.Message):
             db.commit()
             logger.info(f"New user created: {message.from_user.id}")
 
-        welcome_text = """
-🎲 <b>Добро пожаловать в D&D RPG Bot!</b>
-
-Выберите действие в меню ниже.
-"""
-
-        await message.answer(welcome_text, reply_markup=main_menu_keyboard())
+        active_group = get_active_group(db, user)
+        if active_group:
+            label = "Соло игра" if active_group.group_type == "personal" else active_group.title
+            await message.answer(
+                f"🎲 <b>Добро пожаловать в D&D RPG Bot!</b>\n\n"
+                f"Текущий сеттинг: <b>{label}</b>",
+                reply_markup=setting_menu_keyboard()
+            )
+        else:
+            await message.answer(
+                "🎲 <b>Добро пожаловать в D&D RPG Bot!</b>\n\n"
+                "Выберите сеттинг:",
+                reply_markup=setting_selection_keyboard()
+            )
 
     except Exception as e:
         logger.error(f"Error in start_command: {e}")
@@ -67,23 +171,190 @@ async def start_command(message: types.Message):
 
 @router.message(Command("menu"))
 async def menu_command(message: types.Message):
-    """Show the main game menu."""
-    await message.answer(
-        "🎮 <b>Главное меню</b>\n\n"
-        "Выберите действие:",
-        reply_markup=main_menu_keyboard()
-    )
+    """Show setting selection or current setting menu."""
+    db: Session = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == message.from_user.id).first()
+        if not user:
+            user = User(
+                id=message.from_user.id,
+                username=message.from_user.username,
+                full_name=message.from_user.full_name
+            )
+            db.add(user)
+            db.commit()
+        active_group = get_active_group(db, user)
+        if active_group:
+            label = "Соло игра" if active_group.group_type == "personal" else active_group.title
+            await message.answer(
+                f"🎮 <b>Меню сеттинга</b>\n\n<b>{label}</b>",
+                reply_markup=setting_menu_keyboard()
+            )
+        else:
+            await message.answer(
+                "🎮 <b>Выбор сеттинга</b>\n\nВыберите, где играть:",
+                reply_markup=setting_selection_keyboard()
+            )
+    finally:
+        db.close()
 
 
 @router.callback_query(F.data == "main_menu")
 async def main_menu_callback(query: types.CallbackQuery, state: FSMContext):
-    """Return to the main game menu."""
+    """Return to the current setting menu."""
+    await state.clear()
+    db: Session = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == query.from_user.id).first()
+        active_group = get_active_group(db, user) if user else None
+        if not active_group:
+            await query.message.edit_text(
+                "🎮 <b>Выбор сеттинга</b>\n\nВыберите, где играть:",
+                reply_markup=setting_selection_keyboard()
+            )
+        else:
+            label = "Соло игра" if active_group.group_type == "personal" else active_group.title
+            await query.message.edit_text(
+                f"🎮 <b>Меню сеттинга</b>\n\n<b>{label}</b>",
+                reply_markup=setting_menu_keyboard()
+            )
+    finally:
+        db.close()
+    await query.answer()
+
+
+@router.callback_query(F.data == "setting_select")
+async def setting_select_callback(query: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await query.message.edit_text(
-        "🎮 <b>Главное меню</b>\n\n"
-        "Выберите действие:",
-        reply_markup=main_menu_keyboard()
+        "🎮 <b>Выбор сеттинга</b>\n\nВыберите, где играть:",
+        reply_markup=setting_selection_keyboard()
     )
+    await query.answer()
+
+
+@router.callback_query(F.data == "setting_solo")
+async def setting_solo_callback(query: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    db: Session = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == query.from_user.id).first()
+        if not user:
+            user = User(id=query.from_user.id, username=query.from_user.username, full_name=query.from_user.full_name)
+            db.add(user)
+            db.commit()
+        group = get_or_create_personal_group(db, user.id)
+        user.active_group_id = group.id
+        if group.world_description:
+            ensure_campaign_start(db, group)
+        db.commit()
+        await query.message.edit_text(
+            "🏠 <b>Соло игра</b>\n\nВы в персональном сеттинге.",
+            reply_markup=setting_menu_keyboard()
+        )
+    finally:
+        db.close()
+    await query.answer()
+
+
+@router.callback_query(F.data == "setting_group_list")
+async def setting_group_list_callback(query: types.CallbackQuery):
+    db: Session = SessionLocal()
+    try:
+        groups = db.query(Group).join(GroupMember).filter(
+            GroupMember.user_id == query.from_user.id,
+            Group.group_type != "personal"
+        ).order_by(Group.title).all()
+
+        rows = []
+        for group in groups:
+            title = (group.title or f"Группа {group.id}")[:40]
+            rows.append([InlineKeyboardButton(
+                text=f"👥 {title}",
+                callback_data=f"setting_group_{group.id}"
+            )])
+        rows.append([InlineKeyboardButton(text="↩️ Вернуться к выбору", callback_data="setting_select")])
+
+        text = "👥 <b>Групповая игра</b>\n\n"
+        if groups:
+            text += "Выберите кампанию из групп, где вы состоите:"
+        else:
+            text += (
+                "У вас пока нет групповых кампаний.\n\n"
+                "Создайте групповой чат в Telegram, добавьте туда бота и "
+                "используйте /setup_campaign в группе."
+            )
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    finally:
+        db.close()
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("setting_group_"))
+async def setting_group_select_callback(query: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        group_id = int(query.data.replace("setting_group_", ""))
+    except ValueError:
+        await query.answer("Некорректный сеттинг.", show_alert=True)
+        return
+
+    db: Session = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == query.from_user.id).first()
+        if not user:
+            await query.answer("Пользователь не найден.", show_alert=True)
+            return
+        member = db.query(GroupMember).filter(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == user.id
+        ).first()
+        group = db.query(Group).filter(Group.id == group_id).first()
+        if not member or not group or group.group_type == "personal":
+            await query.answer("Этот групповой сеттинг недоступен.", show_alert=True)
+            return
+
+        user.active_group_id = group.id
+        if group.world_description:
+            ensure_campaign_start(db, group)
+        db.commit()
+
+        character = db.query(Character).filter(
+            Character.user_id == user.id,
+            Character.group_id == group.id
+        ).first()
+        if not group.world_description:
+            await state.set_state(MenuStates.entering_group_setting_style)
+            await state.update_data(setting_group_id=group.id)
+            await query.message.edit_text(
+                f"🗺️ <b>{group.title}</b>\n\n"
+                "Этот групповой сеттинг ещё не описан. Опишите мир кампании "
+                "(как при пересборке сеттинга):",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="↩️ Вернуться к выбору", callback_data="setting_select")]
+                ])
+            )
+            await query.answer()
+            return
+
+        if not character:
+            await query.message.edit_text(
+                f"👥 <b>{group.title}</b>\n\n"
+                "У вас нет персонажа в этом сеттинге. Создайте его, чтобы начать.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🧙 Создать персонажа", callback_data=f"create_character_group_{group.id}")],
+                    [InlineKeyboardButton(text="↩️ Вернуться к выбору", callback_data="setting_select")],
+                ])
+            )
+            await query.answer()
+            return
+
+        await query.message.edit_text(
+            f"👥 <b>{group.title}</b>\n\nСеттинг выбран.",
+            reply_markup=setting_menu_keyboard()
+        )
+    finally:
+        db.close()
     await query.answer()
 
 
@@ -92,8 +363,14 @@ async def menu_profile_callback(query: types.CallbackQuery, state: FSMContext):
     """Show the profile if a character exists; otherwise start character creation."""
     db: Session = SessionLocal()
     try:
+        user = db.query(User).filter(User.id == query.from_user.id).first()
+        active_group = get_active_group(db, user) if user else None
+        if not active_group:
+            await query.answer("Сначала выберите сеттинг.", show_alert=True)
+            return
         character = db.query(Character).filter(
-            Character.user_id == query.from_user.id
+            Character.user_id == query.from_user.id,
+            Character.group_id == active_group.id
         ).first()
         if character:
             await show_profile_callback(query)
@@ -109,11 +386,20 @@ async def menu_action_callback(query: types.CallbackQuery, state: FSMContext):
     """Start the existing /action input flow from the menu."""
     db: Session = SessionLocal()
     try:
+        user = db.query(User).filter(User.id == query.from_user.id).first()
+        active_group = get_active_group(db, user) if user else None
+        if not active_group:
+            await query.answer("Сначала выберите сеттинг.", show_alert=True)
+            return
         character = db.query(Character).filter(
-            Character.user_id == query.from_user.id
+            Character.user_id == query.from_user.id,
+            Character.group_id == active_group.id
         ).first()
         if not character:
             await query.answer("Сначала создайте персонажа через «Профиль».", show_alert=True)
+            return
+        if active_group.group_type != "personal":
+            await query.answer("В групповых сеттингах действия выполняются в групповом чате.", show_alert=True)
             return
 
         await query.message.answer(
@@ -254,6 +540,55 @@ async def save_personal_setting_style(message: types.Message, state: FSMContext)
         db.close()
 
 
+@router.message(MenuStates.entering_group_setting_style, F.text)
+async def save_group_setting_style(message: types.Message, state: FSMContext):
+    style = (message.text or "").strip()
+    if len(style) < 3:
+        await message.answer("Опишите групповой мир чуть подробнее (минимум 3 символа).")
+        return
+    if len(style) > 1500:
+        await message.answer("Описание слишком длинное. Максимум 1500 символов.")
+        return
+    data = await state.get_data()
+    db: Session = SessionLocal()
+    try:
+        group = db.query(Group).filter(Group.id == data.get("setting_group_id")).first()
+        user = db.query(User).filter(User.id == message.from_user.id).first()
+        if not group or not user:
+            await message.answer("Групповой сеттинг не найден.")
+            await state.clear()
+            return
+        group.world_description = (
+            f"Обязательный стиль группового сеттинга: {style}. "
+            "Все игроки находятся в одном мире; сохраняй единый канон, "
+            "историю, локации и NPC для всей группы."
+        )
+        user.active_group_id = group.id
+        ensure_campaign_start(db, group)
+        db.commit()
+        await state.clear()
+        character = db.query(Character).filter(
+            Character.user_id == user.id,
+            Character.group_id == group.id
+        ).first()
+        keyboard = (
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🧙 Создать персонажа", callback_data="create_character")],
+                [InlineKeyboardButton(text="↩️ Вернуться к выбору", callback_data="setting_select")]
+            ]) if not character else setting_menu_keyboard()
+        )
+        await message.answer(
+            f"✅ Групповой сеттинг <b>{group.title}</b> сохранён.",
+            reply_markup=keyboard
+        )
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to save group setting style")
+        await message.answer("Не удалось сохранить групповой сеттинг.")
+    finally:
+        db.close()
+
+
 @router.callback_query(F.data == "action_menu")
 async def action_menu_callback(query: types.CallbackQuery):
     """Action menu"""
@@ -376,9 +711,16 @@ async def show_profile_callback(query: types.CallbackQuery):
     """Show user profile"""
     db: Session = SessionLocal()
     try:
-        # Get character for this user
+        user = db.query(User).filter(User.id == query.from_user.id).first()
+        active_group = get_active_group(db, user) if user else None
+        if not active_group:
+            await query.answer("Сначала выберите сеттинг.", show_alert=True)
+            return
+
+        # Get this user's character in the selected setting, not any other campaign.
         character = db.query(Character).filter(
-            Character.user_id == query.from_user.id
+            Character.user_id == query.from_user.id,
+            Character.group_id == active_group.id
         ).first()
 
         if not character:

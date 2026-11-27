@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS users (
     id BIGINT PRIMARY KEY,
     username VARCHAR(255) UNIQUE,
     full_name VARCHAR(255),
+    active_group_id BIGINT,
     is_premium BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -19,14 +20,34 @@ CREATE TABLE IF NOT EXISTS groups (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Keep existing databases compatible when the init script is run manually.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS active_group_id BIGINT;
+
+-- The foreign key is added after both sides exist.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint c
+        JOIN pg_attribute a ON a.attrelid = c.conrelid
+        WHERE c.conrelid = 'users'::regclass
+          AND c.contype = 'f'
+          AND a.attname = 'active_group_id'
+          AND a.attnum = ANY(c.conkey)
+    ) THEN
+        ALTER TABLE users
+            ADD CONSTRAINT fk_users_active_group
+            FOREIGN KEY (active_group_id) REFERENCES groups(id) ON DELETE SET NULL;
+    END IF;
+END $$;
+
 -- Group members (users in groups)
 CREATE TABLE IF NOT EXISTS group_members (
     id SERIAL PRIMARY KEY,
     group_id BIGINT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     role VARCHAR(50) DEFAULT 'player',
-    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(group_id, user_id)
+    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Characters table
@@ -42,8 +63,7 @@ CREATE TABLE IF NOT EXISTS characters (
     current_hp INT NOT NULL,
     experience INT DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, group_id)
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Character attributes (STR, DEX, CON, INT, WIS, CHA)
@@ -93,8 +113,7 @@ CREATE TABLE IF NOT EXISTS inventory (
     quantity INT DEFAULT 1,
     is_equipped BOOLEAN DEFAULT FALSE,
     slot VARCHAR(50),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(character_id, item_id)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Locations in the world
@@ -113,8 +132,7 @@ CREATE TABLE IF NOT EXISTS location_connections (
     from_location_id INT NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
     to_location_id INT NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
     description VARCHAR(255),
-    is_bidirectional BOOLEAN DEFAULT TRUE,
-    UNIQUE(from_location_id, to_location_id)
+    is_bidirectional BOOLEAN DEFAULT TRUE
 );
 
 -- NPCs in locations
@@ -227,6 +245,14 @@ CREATE TABLE IF NOT EXISTS character_spells (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Character currency
+CREATE TABLE IF NOT EXISTS character_currency (
+    character_id INT PRIMARY KEY REFERENCES characters(id) ON DELETE CASCADE,
+    gold INT NOT NULL DEFAULT 0,
+    silver INT NOT NULL DEFAULT 0,
+    copper INT NOT NULL DEFAULT 0
+);
+
 -- Combat encounters
 CREATE TABLE IF NOT EXISTS combat_encounters (
     id SERIAL PRIMARY KEY,
@@ -252,12 +278,34 @@ CREATE TABLE IF NOT EXISTS combat_participants (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Campaign-wide quest offers and one-time completion state
+CREATE TABLE IF NOT EXISTS campaign_quests (
+    id SERIAL PRIMARY KEY,
+    group_id BIGINT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    character_id INT NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    npc_id INT NOT NULL REFERENCES campaign_npcs(id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    description TEXT NOT NULL,
+    reward_xp INT NOT NULL DEFAULT 100,
+    reward_gold INT NOT NULL DEFAULT 0,
+    reward_silver INT NOT NULL DEFAULT 0,
+    reward_copper INT NOT NULL DEFAULT 0,
+    reward_items_json TEXT,
+    reward_spells_json TEXT,
+    status VARCHAR(30) NOT NULL DEFAULT 'offered',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP
+);
+
 -- Create indexes for performance
 CREATE INDEX IF NOT EXISTS idx_characters_user_id ON characters(user_id);
 CREATE INDEX IF NOT EXISTS idx_characters_group_id ON characters(group_id);
 CREATE INDEX IF NOT EXISTS idx_inventory_character_id ON inventory(character_id);
 CREATE INDEX IF NOT EXISTS idx_locations_group_id ON locations(group_id);
 CREATE INDEX IF NOT EXISTS idx_game_sessions_group_id ON game_sessions(group_id);
+CREATE INDEX IF NOT EXISTS idx_campaign_quests_group_id ON campaign_quests(group_id);
+CREATE INDEX IF NOT EXISTS idx_campaign_quests_character_id ON campaign_quests(character_id);
+CREATE INDEX IF NOT EXISTS idx_campaign_quests_npc_id ON campaign_quests(npc_id);
 CREATE INDEX IF NOT EXISTS idx_action_history_group_id ON action_history(group_id);
 CREATE INDEX IF NOT EXISTS idx_action_history_character_id ON action_history(character_id);
 CREATE INDEX IF NOT EXISTS idx_group_members_group_id ON group_members(group_id);

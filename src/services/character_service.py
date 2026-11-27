@@ -67,6 +67,7 @@ class CharacterService:
             existing = db.query(Character).filter(
                 and_(
                     Character.user_id == user_id,
+                    Character.group_id == group_id,
                     Character.name == name
                 )
             ).first()

@@ -2,7 +2,7 @@ from aiogram import Router, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile, ForceReply
 from sqlalchemy.orm import Session
 from src.models.base import SessionLocal
 from src.models import (
@@ -21,6 +21,7 @@ from src.services.open5e_rules_service import (
 from src.services.open5e_localization import canonical_item_name, localized_item_type
 from src.services.character_service import add_experience, XP_THRESHOLDS
 from src.utils import format_error
+from src.services.campaign_context import resolve_character, resolve_group
 import logging
 import base64
 import httpx
@@ -189,9 +190,7 @@ async def kirito_secret_command(message: types.Message):
     """Secretly grant 1 HP or revive a fallen character without changing max HP."""
     db: Session = SessionLocal()
     try:
-        character = db.query(Character).filter(
-            Character.user_id == message.from_user.id
-        ).first()
+        character = resolve_character(db, message.from_user.id, message.chat)
         if not character:
             await message.answer("❌ Персонаж не найден.")
             return
@@ -946,9 +945,7 @@ async def inspect_entity_command(message: types.Message):
     """Inspect known people and creatures, optionally by name."""
     db: Session = SessionLocal()
     try:
-        character = db.query(Character).filter(
-            Character.user_id == message.from_user.id
-        ).first()
+        character = resolve_character(db, message.from_user.id, message.chat)
         if not character:
             await message.answer("Сначала создайте персонажа.")
             return
@@ -1066,14 +1063,7 @@ async def action_command(message: types.Message, state: FSMContext):
     """Start action sequence"""
     db: Session = SessionLocal()
     try:
-        # Get user's default group
-        from src.models import Group, GroupMember
-        default_group = db.query(Group).join(
-            GroupMember
-        ).filter(
-            GroupMember.user_id == message.from_user.id,
-            GroupMember.role == "gm"
-        ).first()
+        default_group = resolve_group(db, message.from_user.id, message.chat)
 
         if not default_group:
             await message.answer("❌ Создайте персонажа командой /create_character")
@@ -1098,7 +1088,11 @@ async def action_command(message: types.Message, state: FSMContext):
 
         await message.answer(
             f"⚔️ <b>Действие персонажа {character.name}</b>\n\n"
-            "Опишите, что вы хотите сделать:"
+            "Опишите, что вы хотите сделать:",
+            reply_markup=ForceReply(
+                selective=False,
+                input_field_placeholder="Опишите действие"
+            )
         )
         await state.set_state(ActionStates.describing_action)
 
@@ -1121,9 +1115,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
             return
 
         # Get character
-        character = db.query(Character).filter(
-            Character.user_id == message.from_user.id
-        ).first()
+        character = resolve_character(db, message.from_user.id, message.chat)
 
         if not character:
             await message.answer(format_error("Персонаж не найден"))
@@ -2606,9 +2598,7 @@ async def continue_action_callback(query: types.CallbackQuery, state: FSMContext
     """Prompt for another action without requiring the /action command."""
     db: Session = SessionLocal()
     try:
-        character = db.query(Character).filter(
-            Character.user_id == query.from_user.id
-        ).first()
+        character = resolve_character(db, query.from_user.id, query.message.chat)
         if not character:
             await query.answer("Персонаж не найден", show_alert=True)
             return
@@ -2620,7 +2610,11 @@ async def continue_action_callback(query: types.CallbackQuery, state: FSMContext
 
         await query.message.answer(
             f"⚔️ <b>Действие персонажа {character.name}</b>\n\n"
-            "Опишите следующее действие:"
+            "Опишите следующее действие:",
+            reply_markup=ForceReply(
+                selective=False,
+                input_field_placeholder="Опишите действие"
+            )
         )
         await state.set_state(ActionStates.describing_action)
         await query.answer()
@@ -2637,9 +2631,7 @@ async def travel_command(message: types.Message, state: FSMContext):
     db: Session = SessionLocal()
     try:
         # Get character
-        character = db.query(Character).filter(
-            Character.user_id == message.from_user.id
-        ).first()
+        character = resolve_character(db, message.from_user.id, message.chat)
 
         if not character:
             await message.answer("❌ У вас нет персонажа")
@@ -2663,31 +2655,30 @@ async def location_command(message: types.Message):
     db: Session = SessionLocal()
     try:
         # Get character
-        character = db.query(Character).filter(
-            Character.user_id == message.from_user.id
-        ).first()
+        character = resolve_character(db, message.from_user.id, message.chat)
 
         if not character:
             await message.answer("❌ У вас нет персонажа")
             return
 
-        # Get group and world description
-        from src.models import Group
-        group = db.query(Group).filter(Group.id == character.group_id).first()
-        world_desc = group.world_description if group else "Неизвестный мир"
-
-        location_text = f"""
-📍 <b>Текущая локация</b>
-
-Ваш персонаж: <b>{character.name}</b>
-
-<b>Мир:</b>
-{world_desc}
-
-Используй /action для выполнения действия
-"""
-
-        await message.answer(location_text)
+        session = db.query(GameSession).filter(
+            GameSession.group_id == character.group_id
+        ).first()
+        if not session or not session.current_location_id:
+            await message.answer("❌ Сессия ещё не получила начальную локацию.")
+            return
+        location = db.query(Location).filter(
+            Location.id == session.current_location_id
+        ).first()
+        if not location:
+            await message.answer("❌ Текущая локация не найдена.")
+            return
+        connections = GroupService.get_connected_locations(db, location.id)
+        text = f"📍 <b>{location.name}</b>\n\n{location.description or ''}"
+        if connections:
+            text += "\n\n<b>Возможные направления:</b>"
+            text += "".join(f"\n• {connection[1].name}" for connection in connections)
+        await message.answer(text)
 
     except Exception as e:
         logger.error(f"Error in location_command: {e}")
@@ -2702,9 +2693,7 @@ async def travel_command(message: types.Message):
     db: Session = SessionLocal()
     try:
         # Get character
-        character = db.query(Character).filter(
-            Character.user_id == message.from_user.id
-        ).first()
+        character = resolve_character(db, message.from_user.id, message.chat)
 
         if not character:
             await message.answer("❌ У вас нет персонажа")
@@ -2945,23 +2934,14 @@ async def location_command(message: types.Message):
     db: Session = SessionLocal()
     try:
         # Get user's default group
-        from src.models import Group, GroupMember
-        default_group = db.query(Group).join(
-            GroupMember
-        ).filter(
-            GroupMember.user_id == message.from_user.id,
-            GroupMember.role == "gm"
-        ).first()
+        default_group = resolve_group(db, message.from_user.id, message.chat)
 
         if not default_group:
             await message.answer(format_error("Создайте персонажа командой /create_character"))
             return
 
         # Get character
-        character = db.query(Character).filter(
-            Character.user_id == message.from_user.id,
-            Character.group_id == default_group.id
-        ).first()
+        character = resolve_character(db, message.from_user.id, message.chat)
 
         if not character:
             await message.answer("❌ У вас нет персонажа")
@@ -3012,23 +2992,14 @@ async def inventory_command(message: types.Message):
     db: Session = SessionLocal()
     try:
         # Get user's default group
-        from src.models import Group, GroupMember
-        default_group = db.query(Group).join(
-            GroupMember
-        ).filter(
-            GroupMember.user_id == message.from_user.id,
-            GroupMember.role == "gm"
-        ).first()
+        default_group = resolve_group(db, message.from_user.id, message.chat)
 
         if not default_group:
             await message.answer(format_error("Создайте персонажа командой /create_character"))
             return
 
         # Get character
-        character = db.query(Character).filter(
-            Character.user_id == message.from_user.id,
-            Character.group_id == default_group.id
-        ).first()
+        character = resolve_character(db, message.from_user.id, message.chat)
 
         if not character:
             await message.answer("❌ У вас нет персонажа")

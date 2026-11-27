@@ -4,7 +4,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy.orm import Session
 from src.models.base import SessionLocal
 from src.models import (
-    Character, CharacterAttribute, CharacterAbility, CharacterSpell,
+    User, Group, Character, CharacterAttribute, CharacterAbility, CharacterSpell,
     Inventory, Item, GroupMember, CharacterCurrency
 )
 from src.services import CharacterService
@@ -12,6 +12,7 @@ from src.services import GameEngineService
 from src.services.open5e_localization import localized_feature_description
 from src.services.inventory_service import InventoryService
 from src.services.character_service import xp_for_next_level
+from src.services.campaign_context import resolve_group, resolve_character
 from src.utils import format_error
 import logging
 
@@ -24,14 +25,7 @@ async def profile_command(message: types.Message):
     """Show character profile"""
     db: Session = SessionLocal()
     try:
-        # Get user's default group
-        from src.models import Group, GroupMember
-        default_group = db.query(Group).join(
-            GroupMember
-        ).filter(
-            GroupMember.user_id == message.from_user.id,
-            GroupMember.role == "gm"
-        ).first()
+        default_group = resolve_group(db, message.from_user.id, message.chat)
 
         if not default_group:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -46,10 +40,7 @@ async def profile_command(message: types.Message):
             return
 
         # Get character for this user
-        character = db.query(Character).filter(
-            Character.user_id == message.from_user.id,
-            Character.group_id == default_group.id
-        ).first()
+        character = resolve_character(db, message.from_user.id, message.chat)
 
         if not character:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
