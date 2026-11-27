@@ -28,6 +28,7 @@ import re
 import json
 import html
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Optional
 from io import BytesIO
 
@@ -70,6 +71,77 @@ def _entity_xp_reward(db: Session, entity: GameEntity, character_level: int) -> 
         if cr_key in XP_BY_CR:
             return XP_BY_CR[cr_key]
     return max(25, character_level * 25)
+
+
+_NUMBER_WORDS_RU = {
+    "ноль": 0, "один": 1, "одна": 1, "одного": 1, "одном": 1,
+    "два": 2, "две": 2, "двух": 2, "три": 3, "трёх": 3, "трех": 3,
+    "четыре": 4, "четырёх": 4, "четырех": 4, "пять": 5, "пяти": 5,
+    "шесть": 6, "шести": 6, "семь": 7, "семи": 7, "восемь": 8,
+    "восьми": 8, "девять": 9, "девяти": 9, "десять": 10, "десяти": 10,
+    "одиннадцать": 11, "двенадцать": 12, "полтора": 1.5, "полутора": 1.5,
+    "пара": 2, "паре": 2
+}
+
+
+def _last_narrated_distance_feet(entity_name: str, recent_actions: list) -> Optional[float]:
+    """Recover the first established position unless code has since moved the entity."""
+    name = entity_name.casefold()
+    if any(
+        re.search(
+            r"(подхожу|приближаюсь|подойти|иду к|направляюсь к|"
+            r"бегу.{0,50}(?:на|к)|несусь.{0,50}(?:на|к)|"
+            r"бросаюсь.{0,50}(?:на|к)|кидаюсь.{0,50}(?:на|к))",
+            (entry.action_description or "").casefold()
+        )
+        for entry in recent_actions
+    ):
+        return None
+    distance_pattern = re.compile(
+        r"(?P<value>\d+(?:[.,]\d+)?(?:-[а-яё]+)?|[а-яё]+(?:-[а-яё]+)?)\s*"
+        r"(?P<unit>фут\w*|ft\b|метр\w*|м\b)",
+        re.IGNORECASE
+    )
+    for entry in recent_actions:
+        text = entry.ai_response or ""
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+            if name not in sentence.casefold():
+                continue
+            match = distance_pattern.search(sentence)
+            if not match:
+                continue
+            raw_value = match.group("value").replace(",", ".")
+            try:
+                value = float(raw_value)
+            except ValueError:
+                numeric_prefix = re.match(r"^\d+(?:\.\d+)?", raw_value)
+                value = float(numeric_prefix.group(0)) if numeric_prefix else None
+                if value is None:
+                    value = _NUMBER_WORDS_RU.get(raw_value.casefold())
+                if value is None and "-" in raw_value:
+                    left, right = raw_value.casefold().split("-", 1)
+                    left_value = _NUMBER_WORDS_RU.get(left)
+                    right_value = _NUMBER_WORDS_RU.get(right)
+                    if left_value is not None and right_value is not None:
+                        value = left_value + right_value
+            if value is None:
+                continue
+            unit = match.group("unit").casefold()
+            return value * 3.28084 if unit.startswith("метр") or unit == "м" else value
+    return None
+
+
+def _remove_target_distance_claims(narrative: str, target_name: str) -> str:
+    """Prevent contradictory model-authored distances from overriding stored position."""
+    kept = []
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", narrative):
+        if (
+            target_name.casefold() in sentence.casefold()
+            and re.search(r"\d|фут|ft\b|метр|м\b", sentence.casefold())
+        ):
+            continue
+        kept.append(sentence)
+    return " ".join(part.strip() for part in kept if part.strip())
 
 
 async def _send_generated_image(send_photo, prompt: str, caption: str) -> bool:
@@ -452,7 +524,9 @@ def _is_looking_around(action: str) -> bool:
 
 def _is_aggressive_action(action: str) -> bool:
     return bool(re.search(
-        r"(атак\w*|напада\w*|удар\w*|бью|бить|стреля\w*|выстрел\w*|"
+        r"(атак\w*|напада\w*|удар\w*|бью|бить|руб\w*|реж\w*|кол\w*|"
+        r"пронза\w*|поража\w*|сража\w*|strike\w*|attack\w*|slash\w*|stab\w*|hit\b|"
+        r"стреля\w*|выстрел\w*|"
         r"брос\w*|мет\w*|бег\w*.{0,50}(?:на|к|в сторону)\b|"
         r"нес\w*.{0,50}(?:на|к|в сторону)\b|"
         r"бросаюсь.{0,50}(?:на|к|в сторону)\b|"
@@ -783,7 +857,14 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 "attack_bonus": entity.attack_bonus,
                 "damage_dice": entity.damage_dice,
                 "hostile": entity.is_hostile,
-                "distance_m": entity.distance_m,
+                "distance_ft": round(
+                    narrated_distance
+                    if (narrated_distance := _last_narrated_distance_feet(
+                        entity.name, recent_actions
+                    )) is not None
+                    else entity.distance_m * 3.28084,
+                    1
+                ),
                 "alive": entity.is_alive
             }
             for entity in entities
@@ -834,7 +915,10 @@ async def handle_action_description(message: types.Message, state: FSMContext):
             ).first()
             # Roll before the DM adjudicates the action so the result can affect
             # the narrative and consequences.
-            d20_roll = GameEngineService.roll_d20()
+            is_declared_attack = _is_aggressive_action(action_description)
+            # The combat resolver rolls its own attack die after target/range are known.
+            # Do not feed the DM a misleading generic check roll for an attack.
+            d20_roll = None if is_declared_attack else GameEngineService.roll_d20()
 
             # Call AI to get action result
             ai_result = await AIService.process_action(
@@ -950,6 +1034,13 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                                 )
                 if not re.fullmatch(r"\d*d\d+(?:[+-]\d+)?", dice):
                     dice = "d4"
+                entity_distance_m = _safe_int(found_entity.get("distance_m"), 5, 0, 1000)
+                narrated_distance_ft = _last_narrated_distance_feet(
+                    name,
+                    [SimpleNamespace(ai_response=narrative, action_description="")]
+                )
+                if narrated_distance_ft is not None:
+                    entity_distance_m = max(0, int(narrated_distance_ft / 3.28084))
                 db.add(GameEntity(
                     group_id=character.group_id,
                     character_id=character.id,
@@ -962,7 +1053,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     armor_class=armor_class,
                     attack_bonus=attack_bonus,
                     damage_dice=dice,
-                    distance_m=_safe_int(found_entity.get("distance_m"), 5, 0, 1000),
+                    distance_m=entity_distance_m,
                     is_hostile=bool(found_entity.get("is_hostile", False)),
                     is_alive=True
                 ))
@@ -1240,13 +1331,39 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 if len(living_entities) == 1:
                     target = living_entities[0]
 
-            if target and re.search(r"\b(подхожу|приближаюсь|подойти|иду к|направляюсь к)\b", lower_action):
-                target.distance_m = max(0, target.distance_m - 3)
-                narrative += (
-                    f"\n\n📏 До {target.name} осталось примерно {target.distance_m} м."
-                    if target.distance_m > 1
-                    else f"\n\n📏 Вы подошли вплотную к {target.name}."
+            target_distance_feet = None
+            if target:
+                target_distance_feet = _last_narrated_distance_feet(
+                    target.name, recent_actions
                 )
+                if target_distance_feet is None:
+                    target_distance_feet = target.distance_m * 3.28084
+                approach_action = bool(re.search(
+                    r"\b(подхожу|приближаюсь|подойти|иду к|направляюсь к)\b",
+                    lower_action
+                ))
+                charge_action = bool(re.search(
+                    r"\b(бегу|несусь|мчусь|бросаюсь|кидаюсь)\b.{0,50}"
+                    r"(?:на|к|в сторону)\b",
+                    lower_action
+                ))
+                if is_attack_action or approach_action or charge_action:
+                    narrative = _remove_target_distance_claims(narrative, target.name)
+                if approach_action or charge_action:
+                    target_distance_feet = max(
+                        0,
+                        target_distance_feet - (29.5276 if charge_action else 9.84252)
+                    )
+                    target.distance_m = max(0, int(target_distance_feet / 3.28084))
+                narrative += (
+                    f"\n\n📏 Дистанция до {target.name}: "
+                    f"{target_distance_feet:.1f} фт."
+                )
+                if is_attack_action:
+                    narrative += (
+                        f"\n\n📏 На момент атаки до {target.name} "
+                        f"{target_distance_feet:.1f} фт."
+                    )
 
             active_encounter = None
             active_game_session = None
@@ -1305,7 +1422,8 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     )
                     if weapon else None
                 )
-                target_distance_feet = target.distance_m * 3.28084
+                if target_distance_feet is None:
+                    target_distance_feet = target.distance_m * 3.28084
                 if is_ranged_weapon and weapon_range:
                     normal_range_feet = int(weapon_range.group(1))
                     long_range_feet = int(weapon_range.group(2) or normal_range_feet)
@@ -1322,8 +1440,11 @@ async def handle_action_description(message: types.Message, state: FSMContext):
 
                 if weapon_out_of_range:
                     pass
-                elif target.distance_m > 1 and not is_ranged_weapon:
-                    narrative += f"\n\n❌ {target.name} слишком далеко для удара в ближнем бою."
+                elif target_distance_feet > 5 and not is_ranged_weapon:
+                    narrative += (
+                        f"\n\n❌ {target.name} вне дистанции ближней атаки: "
+                        f"{target_distance_feet:.1f} фт. (максимум 5 фт.)."
+                    )
                 else:
                     attributes = db.query(CharacterAttribute).filter(
                         CharacterAttribute.character_id == character.id
@@ -1336,16 +1457,29 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         else dexterity_modifier if is_ranged_weapon
                         else strength_modifier
                     )
+                    ability_label = (
+                        "Ловкость" if is_ranged_weapon
+                        else "Сила" if strength_modifier >= dexterity_modifier
+                        else "Ловкость"
+                    )
                     attack_bonus = ability_modifier + GameEngineService.calculate_proficiency_bonus(character.level)
-                    attack_roll = d20_roll
+                    attack_roll = GameEngineService.roll_d20()
+                    first_attack_roll = attack_roll
                     long_range_disadvantage = bool(
                         is_ranged_weapon and weapon_range
                         and target_distance_feet > int(weapon_range.group(1))
                     )
                     if long_range_disadvantage:
                         second_roll = GameEngineService.roll_d20()
-                        attack_roll = min(d20_roll, second_roll)
+                        attack_roll = min(attack_roll, second_roll)
                     attack_total = attack_roll + attack_bonus
+                    attack_check_text = (
+                        f"🎲 Атака ({ability_label}): "
+                        f"{f'd20({first_attack_roll}) и d20({second_roll}) (помеха)' if long_range_disadvantage else f'd20({attack_roll})'}"
+                        f" + {ability_modifier} ({ability_label.lower()}) + "
+                        f"{GameEngineService.calculate_proficiency_bonus(character.level)} "
+                        f"(владение) = {attack_total} против КД {target.armor_class}."
+                    )
                     if attack_roll == 20 or (attack_roll != 1 and attack_total >= target.armor_class):
                         damage_dice = weapon.damage_dice if weapon and weapon.damage_dice else "d4"
                         fixed_damage = damage_dice.isdigit()
@@ -1375,10 +1509,8 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         )
                         damage_label = f" урона ({damage_type})" if damage_type else " урона"
                         narrative += (
-                            f"\n\n⚔️ {weapon.name if weapon else 'Безоружная атака'}: бросок "
-                            f"{f'{d20_roll} и {second_roll}' if long_range_disadvantage else str(d20_roll)}"
-                            f"{' (помеха)' if long_range_disadvantage else ''}+{attack_bonus} против КД "
-                            f"{target.armor_class}. Попадание! {target.name} получает "
+                            f"\n\n⚔️ {weapon.name if weapon else 'Безоружная атака'}: "
+                            f"{attack_check_text} Попадание! {target.name} получает "
                             f"{damage}{damage_label}: "
                             f"{target.current_hp}/{target.max_hp} HP."
                         )
@@ -1386,10 +1518,8 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                             narrative += f"\n☠️ {target.name} повержен."
                     else:
                         narrative += (
-                            f"\n\n⚔️ {weapon.name if weapon else 'Безоружная атака'}: бросок "
-                            f"{f'{d20_roll} и {second_roll}' if long_range_disadvantage else str(d20_roll)}"
-                            f"{' (помеха)' if long_range_disadvantage else ''}+{attack_bonus} против КД "
-                            f"{target.armor_class}. Промах — урона нет."
+                            f"\n\n⚔️ {weapon.name if weapon else 'Безоружная атака'}: "
+                            f"{attack_check_text} Промах — урона нет."
                         )
 
             loot = ai_result.get("loot", []) if isinstance(ai_result, dict) else []
@@ -1423,7 +1553,12 @@ async def handle_action_description(message: types.Message, state: FSMContext):
 
             damage_text = ""
             damage = ai_result.get("damage", 0) if isinstance(ai_result, dict) else 0
-            if isinstance(ai_result, dict) and ai_result.get("damage_dice"):
+            if is_attack_action or enemy_attacks:
+                # Combat damage is resolved by the explicit attacker/target code below.
+                # Never let the DM's generic player-damage field misapply a goblin hit
+                # or a player's attack as damage to the character.
+                damage = 0
+            elif isinstance(ai_result, dict) and ai_result.get("damage_dice"):
                 damage = max(
                     0,
                     _roll_entity_damage(ai_result["damage_dice"])
@@ -1447,6 +1582,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 and isinstance(ai_result, dict)
                 and ai_result.get("enemy_attacks")
                 and target and target.is_hostile and target.is_alive
+                and target_distance_feet is not None and target_distance_feet <= 5
             ):
                 attributes = db.query(CharacterAttribute).filter(
                     CharacterAttribute.character_id == character.id
@@ -1461,17 +1597,31 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     old_hp = character.current_hp
                     character.current_hp = max(0, character.current_hp - enemy_damage)
                     db.commit()
+                    enemy_attack_total = enemy_roll + target.attack_bonus
                     enemy_attack_text = (
-                        f"\n\n🩸 {target.name} атакует: бросок {enemy_roll}+"
-                        f"{target.attack_bonus} против вашей КД {player_ac} — попадание, "
+                        f"\n\n🩸 {target.name} атакует. 🎲 Проверка атаки: "
+                        f"d20({enemy_roll}) + {target.attack_bonus} = {enemy_attack_total} "
+                        f"против вашей КД {player_ac} — попадание, "
                         f"{old_hp - character.current_hp} урона. "
                         f"Ваше HP: {character.current_hp}/{character.max_hp}."
                     )
                 else:
+                    enemy_attack_total = enemy_roll + target.attack_bonus
                     enemy_attack_text = (
-                        f"\n\n🛡️ {target.name} атакует, но промахивается "
-                        f"(бросок {enemy_roll}+{target.attack_bonus} против КД {player_ac})."
+                        f"\n\n🛡️ {target.name} атакует. 🎲 Проверка атаки: "
+                        f"d20({enemy_roll}) + {target.attack_bonus} = {enemy_attack_total} "
+                        f"против вашей КД {player_ac} — промах."
                     )
+            elif (
+                isinstance(ai_result, dict)
+                and ai_result.get("enemy_attacks")
+                and target and target.is_hostile and target.is_alive
+                and target_distance_feet is not None and target_distance_feet > 5
+            ):
+                enemy_attack_text = (
+                    f"\n\n📏 {target.name} пока слишком далеко для ближней атаки: "
+                    f"{target_distance_feet:.1f} фт."
+                )
 
             if active_encounter and target:
                 active_encounter.enemy_hp = target.current_hp
@@ -1530,7 +1680,11 @@ async def handle_action_description(message: types.Message, state: FSMContext):
             db.add(history_entry)
             db.commit()
 
-            roll_text = f"🎲 <b>Результат броска:</b> {d20_roll}\n\n"
+            roll_text = (
+                ""
+                if is_attack_action
+                else f"🎲 <b>Результат проверки действия:</b> {d20_roll}\n\n"
+            )
 
             currency_note = ""
             currency_delta = ai_result.get("currency", {}) if isinstance(ai_result, dict) else {}

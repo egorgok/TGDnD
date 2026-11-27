@@ -251,12 +251,20 @@ If your narrative says the character picks an item up, takes it, keeps it, or pu
 in a bag/pocket, that item MUST be included in loot using its exact name.
 The d20 result is authoritative: 1 is a disastrous failure, 20 is an exceptional success.
 For 2-19, judge whether the action succeeds based on difficulty and circumstances.
+If the supplied d20 result is null for an attack, do not resolve its success or failure;
+the game code will make a separate attack roll after validating target and range.
 Make the narration and consequences match the roll. On a failed risky physical action,
 describe a fitting setback; apply damage only if an injury is plausible, not automatically.
 For damage defined by supplied SRD rules as dice (including falling, spells, or other
 effects), return only the dice formula in damage_dice (for example "6d6") and its
 modifier separately in damage_bonus; the bot will roll the dice. Use damage only for
 fixed damage without a dice formula.
+For combat, the game code is authoritative for distance, range, attack rolls, hit/miss,
+and combat damage. Quote a known entity's distance exactly as listed in the supplied
+entity context; never invent a new distance or change it without describing movement.
+The "damage" field is ONLY damage to the player from a non-combat hazard. For a player
+weapon attack or an enemy attack, always return damage=0, damage_dice=null, and let
+the game resolve the attacker's damage against the correct target's HP.
 Continuity is mandatory. Treat the supplied current scene and recent actions as facts.
 Do not teleport the character, change location, or assume an action in a different place
 has happened. If the requested action requires being somewhere else, explain in the
@@ -298,8 +306,8 @@ Treat known_npcs as campaign canon across locations. Reuse the same NPC and reta
 established facts exactly if encountered elsewhere. Record durable facts learned in
 conversation in npc_memories. Update their current_location only when established.
 When the player approaches a known entity, do not consume a turn without progress:
-reduce its distance by at least 3 meters, and if within 1 meter mark it as reachable.
-Never let a melee attack hit from beyond 1 meter.
+reduce its distance by at least 3 meters, and if within 5 feet mark it as reachable.
+Never let a melee attack hit from beyond 5 feet.
 If the action names a weapon, return its stored name in weapon_name.
 Treat a clear charge toward a hostile creature while holding/using an object as the
 player initiating an attack, even if they did not use the verb "attack". If a hostile
