@@ -324,7 +324,9 @@ and "damage_dice" (dice only, e.g. "6d6"; otherwise null)
 and "damage_bonus" (separate integer modifier; do not include it in damage_dice)
 and "currency" (coins gained or spent this action: integer gold, silver, copper deltas)
 and "scene_state" (short Russian summary of the character's exact current location,
-position, and immediate situation after this action)
+position, and immediate situation after this action; begin with a stable location name
+such as "Восточная дорога" or "Таверна «Старый дуб»", then a period and brief details.
+Keep the location name identical on later actions in that same place)
 and "location_changed" (true only if the character actually moved to a different named place)
 and "entities" (array of newly encountered named people/creatures, each with name,
 entity_type, description, personality, is_hostile, distance_m, open5e_key if a hostile
@@ -414,6 +416,8 @@ named or noteworthy person/creature that can be interacted with, record their id
 and narrative details. Give a creature combat stats only when you can provide an exact
 matching Open5e/API key; never generate plausible replacement stats. For unclear
 references like "him", choose a target only if exactly one known entity is present.
+For residents, guards, and mysterious human figures, the application applies its
+configured saved archetypes; do not substitute your own numbers for those profiles.
 The party members listed below are real player characters, not NPCs. Never create an
 NPC, monster, entity, portrait, quest target, or separate identity with one of their
 names. If the player says to take, call, follow, help, or travel with one of them,

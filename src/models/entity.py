@@ -1,6 +1,7 @@
 from sqlalchemy import (
     Column, Integer, BigInteger, String, Text, Boolean, DateTime, ForeignKey
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
 
 from src.models.base import Base
@@ -23,6 +24,7 @@ class GameEntity(Base):
     armor_class = Column(Integer, nullable=False, default=10)
     attack_bonus = Column(Integer, nullable=False, default=0)
     damage_dice = Column(String(20), nullable=False, default="d4")
+    ability_scores = Column(JSONB)
     distance_m = Column(Integer, nullable=False, default=5)
     is_hostile = Column(Boolean, nullable=False, default=False)
     is_alive = Column(Boolean, nullable=False, default=True)

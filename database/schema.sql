@@ -163,12 +163,15 @@ CREATE TABLE IF NOT EXISTS game_entities (
     armor_class INT NOT NULL DEFAULT 10,
     attack_bonus INT NOT NULL DEFAULT 0,
     damage_dice VARCHAR(20) NOT NULL DEFAULT 'd4',
+    ability_scores JSONB,
     distance_m INT NOT NULL DEFAULT 5,
     is_hostile BOOLEAN NOT NULL DEFAULT FALSE,
     is_alive BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE game_entities ADD COLUMN IF NOT EXISTS ability_scores JSONB;
 
 -- Campaign-wide NPC identities and factual memories
 CREATE TABLE IF NOT EXISTS campaign_npcs (

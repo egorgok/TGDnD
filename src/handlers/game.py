@@ -587,12 +587,53 @@ def _entity_open5e_key(entity: GameEntity) -> Optional[str]:
 
 
 def _entity_official_profile(db: Session, entity: GameEntity) -> Optional[dict]:
+    if "[combat_profile:manual_human]" in (entity.description or ""):
+        return {
+            "max_hp": entity.max_hp,
+            "armor_class": entity.armor_class,
+            "attack_bonus": entity.attack_bonus,
+            "damage_dice": entity.damage_dice,
+        }
     record = _official_creature_data(
         db,
         _entity_open5e_key(entity) or "",
         entity.name
     )
-    return _official_combat_profile(record) if record else None
+    profile = _official_combat_profile(record) if record else None
+    if profile:
+        return profile
+
+    archetype = _human_combat_archetype(
+        entity.name, entity.entity_type, entity.description or ""
+    )
+    if (
+        not archetype
+        and entity.is_hostile
+        and not re.search(
+            r"гоблин|орк|дракон|монстр|чудовищ|звер|нежит|демон|дьявол|"
+            r"тролл|огр|скелет|зомби|волк|паук|goblin|orc|dragon|monster|"
+            r"beast|undead|fiend|troll|ogre|skeleton|zombie|wolf|spider",
+            f"{entity.name} {entity.entity_type} {entity.description or ''}",
+            re.IGNORECASE
+        )
+    ):
+        archetype = "mysterious"
+    if archetype:
+        manual = _manual_human_profile(archetype)
+        entity.max_hp = manual["max_hp"]
+        entity.current_hp = min(entity.current_hp, entity.max_hp)
+        entity.armor_class = manual["armor_class"]
+        entity.attack_bonus = manual["attack_bonus"]
+        entity.damage_dice = manual["damage_dice"]
+        entity.ability_scores = manual["scores"]
+        entity.description = (entity.description or "") + " [combat_profile:manual_human]"
+        return {
+            "max_hp": entity.max_hp,
+            "armor_class": entity.armor_class,
+            "attack_bonus": entity.attack_bonus,
+            "damage_dice": entity.damage_dice,
+        }
+    return None
 
 
 def _official_hidden_traits(record: Optional[dict]) -> dict:
@@ -691,6 +732,82 @@ _CREATURE_ARCHETYPE_KEYS = {
 }
 
 
+_HUMAN_ABILITY_SCORES = {
+    "commoner": {"strength": 10, "dexterity": 10, "constitution": 10,
+                 "intelligence": 10, "wisdom": 10, "charisma": 10},
+    "guard": {"strength": 13, "dexterity": 12, "constitution": 12,
+              "intelligence": 10, "wisdom": 11, "charisma": 10},
+    "mysterious": {"strength": 10, "dexterity": 10, "constitution": 10,
+                   "intelligence": 10, "wisdom": 10, "charisma": 10},
+}
+
+
+def _human_combat_archetype(name: str, entity_type: str, description: str) -> Optional[str]:
+    text = _normalize_entity_name(f"{name} {entity_type} {description}")
+    if re.search(
+        r"силуэт|тень|таинственн|неизвестн\w*\s+(?:личност|фигур)|"
+        r"скрыт\w*\s+(?:фигур|человек)|mysterious|silhouette|shadowy figure",
+        text
+    ):
+        return "mysterious"
+    if re.search(
+        r"страж|охранник|часовой|караул|городск\w*\s+страж|guard|watchman",
+        text
+    ):
+        return "guard"
+    if re.search(
+        r"трактирщик|хозяин\w*\s+(?:постоял|трактир|таверн)|"
+        r"крестьянин|горожанин|жител\w*|лавочник|торговец|безоружн\w*|"
+        r"обычн\w*\s+человек|commoner|innkeeper|tavernkeeper|peasant|townsfolk",
+        text
+    ):
+        return "commoner"
+    return None
+
+
+def _manual_human_profile(archetype: str) -> dict:
+    if archetype == "guard":
+        return {
+            "max_hp": 11, "armor_class": 16, "attack_bonus": 3,
+            "damage_dice": "1d6+1", "scores": _HUMAN_ABILITY_SCORES["guard"],
+            "label": "стражник",
+        }
+    if archetype == "mysterious":
+        return {
+            "max_hp": 6, "armor_class": 12, "attack_bonus": 0,
+            "damage_dice": "1d4", "scores": _HUMAN_ABILITY_SCORES["mysterious"],
+            "label": "таинственная личность",
+        }
+    return {
+        "max_hp": 4, "armor_class": 10, "attack_bonus": 2,
+        "damage_dice": "1d4", "scores": _HUMAN_ABILITY_SCORES["commoner"],
+        "label": "обычный житель",
+    }
+
+
+def _location_visit_key(scene_state: str) -> str:
+    """A stable-ish location key: first line/sentence, normalized for comparison."""
+    first_part = re.split(r"[\n.!?。]", (scene_state or "").strip(), maxsplit=1)[0]
+    return _normalize_entity_name(first_part)[:180]
+
+
+def _fail_quests_for_npc(db: Session, group_id: int, npc_name: str) -> list[str]:
+    npc = db.query(CampaignNPC).filter(
+        CampaignNPC.group_id == group_id,
+        CampaignNPC.name.ilike(npc_name)
+    ).first()
+    if not npc:
+        return []
+    failed = db.query(CampaignQuest).filter(
+        CampaignQuest.group_id == group_id,
+        CampaignQuest.npc_id == npc.id,
+        CampaignQuest.status == "offered"
+    ).all()
+    for quest in failed:
+        quest.status = "failed"
+    return [quest.title for quest in failed]
+
+
 def _official_archetype_data(db: Session, name: str, entity_type: str) -> tuple[Optional[dict], Optional[str]]:
     """Find a real imported Open5e creature to use as a generic archetype."""
     text = _normalize_entity_name(f"{name} {entity_type}")
@@ -764,6 +881,23 @@ def _choose_weapon(weapons: list[Item], action: str) -> Optional[Item]:
         if _normalize_entity_name(weapon.name) in normalized_action:
             return weapon
     return weapons[0]
+
+
+def _is_improvised_weapon_action(action: str, carried_weapons: list[Item]) -> bool:
+    """Detect an explicitly named non-catalog object so it doesn't use a carried sword."""
+    normalized = _normalize_entity_name(action)
+    object_markers = (
+        "камн", "стул", "бутыл", "факел", "палк", "кирпич", "доск",
+        "труб", "кружк", "чашк", "поднос", "сапог", "кулак", "руками",
+        "самодельн", "чем то", "предметом", "обломком",
+    )
+    if not any(marker in normalized for marker in object_markers):
+        return False
+    return not any(
+        _normalize_entity_name(weapon.name) in normalized
+        for weapon in carried_weapons
+        if weapon.name
+    )
 
 
 def _roll_entity_damage(dice: str, critical: bool = False) -> int:
@@ -1121,7 +1255,7 @@ async def inspect_entity_command(message: types.Message):
             ).order_by(CampaignQuest.created_at.asc()).all()
             quest_text = "\n".join(
                 f"• {html.escape(quest.title)} — "
-                f"{'выполнено' if quest.status == 'completed' else 'активно'} "
+                f"{'выполнено' if quest.status == 'completed' else 'провалено' if quest.status == 'failed' else 'активно'} "
                 f"({_quest_reward_text(quest)})\n  {html.escape(quest.description)}"
                 for quest in quests
             )
@@ -1431,6 +1565,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     )
                 ),
                 "personality": entity.personality,
+                "ability_scores": entity.ability_scores,
                 "hp": f"{entity.current_hp}/{entity.max_hp}",
                 "ac": entity.armor_class,
                 "attack_bonus": entity.attack_bonus,
@@ -1721,10 +1856,35 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 )
             )
             scene_image_kind = (
-                "location" if isinstance(ai_result, dict) and ai_result.get("location_changed")
-                else "look" if _is_looking_around(action_description)
+                "look" if _is_looking_around(action_description)
+                else "location" if isinstance(ai_result, dict) and ai_result.get("location_changed")
                 else None
             )
+            if (
+                scene_image_kind == "location"
+                and isinstance(ai_result, dict)
+            ):
+                destination_key = _location_visit_key(
+                    str(ai_result.get("scene_state") or "")
+                )
+                if destination_key:
+                    previously_visited = False
+                    for (consequences,) in db.query(
+                        ActionHistory.consequences
+                    ).filter(
+                        ActionHistory.group_id == character.group_id
+                    ).all():
+                        try:
+                            prior_state = json.loads(consequences or "{}").get(
+                                "scene_state", ""
+                            )
+                        except (json.JSONDecodeError, AttributeError, TypeError):
+                            continue
+                        if _location_visit_key(str(prior_state)) == destination_key:
+                            previously_visited = True
+                            break
+                    if previously_visited:
+                        scene_image_kind = None
             new_npc_for_image = None
             if isinstance(ai_result, dict):
                 for npc_data in ai_result.get("npcs", []):
@@ -1777,10 +1937,25 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     re.IGNORECASE
                 ))
                 requires_api_profile = is_hostile_entity or is_monster_entity
-                official = _official_creature_data(db, open5e_key, name)
+                manual_profile = None
+                human_archetype = _human_combat_archetype(
+                    name,
+                    entity_type,
+                    str(found_entity.get("description") or "")
+                )
+                if not human_archetype and is_hostile_entity and not is_monster_entity:
+                    human_archetype = "mysterious"
+                if human_archetype and not is_monster_entity:
+                    manual_profile = _manual_human_profile(human_archetype)
+                official = None if manual_profile else _official_creature_data(
+                    db, open5e_key, name
+                )
                 if official and not open5e_key:
                     open5e_key = str(official.get("key") or "").strip()
-                combat_profile = _official_combat_profile(official) if official else None
+                combat_profile = (
+                    manual_profile
+                    or (_official_combat_profile(official) if official else None)
+                )
                 if requires_api_profile and not combat_profile:
                     # Use only an imported Open5e creature as a generic archetype
                     # (e.g. an unnamed hostile person becomes a bandit/guard).
@@ -1791,11 +1966,17 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         _official_combat_profile(official) if official else None
                     )
                     if combat_profile:
-                        open5e_key = archetype_key
-                        narrative += (
-                            f"\n\nСущество распознано как типичный архетип "
-                            f"«{entity_type}»."
-                        )
+                        if manual_profile:
+                            narrative += (
+                                f"\n\nДля существа используется профиль: "
+                                f"{manual_profile['label']}."
+                            )
+                        else:
+                            open5e_key = archetype_key
+                            narrative += (
+                                f"\n\nСущество распознано как типичный архетип "
+                                f"«{entity_type}»."
+                            )
                     else:
                         # Keep the identity in campaign memory, but do not create
                         # a combat target with AI-invented/defaulted statistics.
@@ -1820,7 +2001,12 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                             "не разрешён."
                         )
                         continue
-                if combat_profile:
+                if manual_profile:
+                    max_hp = manual_profile["max_hp"]
+                    armor_class = manual_profile["armor_class"]
+                    attack_bonus = manual_profile["attack_bonus"]
+                    dice = manual_profile["damage_dice"]
+                elif combat_profile:
                     max_hp = combat_profile["max_hp"]
                     armor_class = combat_profile["armor_class"]
                     attack_bonus = combat_profile["attack_bonus"]
@@ -1852,8 +2038,13 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     entity_type=entity_type,
                     description=(
                         str(found_entity.get("description") or "")[:1800]
+                        + (
+                            " [combat_profile:manual_human]"
+                            if manual_profile else ""
+                        )
                         + (f" [open5e_key:{open5e_key}]" if combat_profile and open5e_key else "")
                     ),
+                    ability_scores=manual_profile["scores"] if manual_profile else None,
                     personality=str(found_entity.get("personality") or "")[:1000],
                     current_hp=max_hp,
                     max_hp=max_hp,
@@ -2011,6 +2202,22 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     title = str(completion.get("title") or "").strip()[:255]
                     if not npc_name or not title:
                         continue
+                    if _is_aggressive_action(action_description):
+                        declared_target = str(
+                            ai_result.get("target_name") or ""
+                        ).strip()
+                        action_mentions_npc = (
+                            _normalize_entity_name(npc_name)
+                            and _normalize_entity_name(npc_name) in
+                            _normalize_entity_name(action_description)
+                        )
+                        if (
+                            declared_target.casefold() == npc_name.casefold()
+                            or action_mentions_npc
+                        ):
+                            # Killing/attacking the quest giver is not a quest
+                            # completion; death resolution will fail the quest.
+                            continue
                     quest = db.query(CampaignQuest).join(
                         CampaignNPC, CampaignNPC.id == CampaignQuest.npc_id
                     ).filter(
@@ -2243,6 +2450,40 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         GameEntity.name.ilike(target_name),
                         GameEntity.is_alive.is_(True)
                     ).first()
+                    if target is None:
+                        npc_target = db.query(CampaignNPC).filter(
+                            CampaignNPC.group_id == character.group_id,
+                            CampaignNPC.name.ilike(target_name),
+                            CampaignNPC.is_alive.is_(True)
+                        ).first()
+                        if npc_target:
+                            npc_archetype = _human_combat_archetype(
+                                npc_target.name,
+                                npc_target.role or "person",
+                                npc_target.description or ""
+                            ) or ("mysterious" if npc_target.is_hostile else "commoner")
+                            npc_profile = _manual_human_profile(npc_archetype)
+                            target = GameEntity(
+                                group_id=character.group_id,
+                                character_id=character.id,
+                                name=npc_target.name,
+                                entity_type=npc_target.role or "person",
+                                description=(npc_target.description or "")
+                                + " [combat_profile:manual_human]",
+                                personality=npc_target.personality,
+                                current_hp=npc_profile["max_hp"],
+                                max_hp=npc_profile["max_hp"],
+                                armor_class=npc_profile["armor_class"],
+                                attack_bonus=npc_profile["attack_bonus"],
+                                damage_dice=npc_profile["damage_dice"],
+                                ability_scores=npc_profile["scores"],
+                                distance_m=0,
+                                is_hostile=True,
+                                is_alive=True,
+                            )
+                            npc_target.is_hostile = True
+                            db.add(target)
+                            db.flush()
 
             is_attack_action = _is_aggressive_action(action_description)
             enemy_attacks = bool(
@@ -2256,6 +2497,8 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 if len(living_entities) == 1:
                     target = living_entities[0]
             if target and (is_attack_action or enemy_attacks):
+                if is_attack_action:
+                    target.is_hostile = True
                 if _entity_official_profile(db, target) is None:
                     narrative += (
                         f"\n\n⚠️ Для {target.name} не удалось подтвердить боевой блок "
@@ -2348,14 +2591,12 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     Inventory.character_id == character.id,
                     Item.item_type.like("weapon:%")
                 ).order_by(Item.name).all()
-                carried_weapons = [
-                    candidate for candidate in carried_weapons
-                    if is_open5e_catalog_item(db, candidate)
-                ]
                 requested_weapon = (
                     ai_result.get("weapon_name") if isinstance(ai_result, dict) else None
                 )
-                weapon = next(
+                weapon = None if _is_improvised_weapon_action(
+                    lower_action, carried_weapons
+                ) else next(
                     (
                         candidate for candidate in carried_weapons
                         if requested_weapon
@@ -2393,7 +2634,11 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     party_target, defender_attributes, db
                 )
                 if attack_roll == 20 or (attack_roll != 1 and attack_total >= target_ac):
-                    damage_dice = weapon.damage_dice if weapon and weapon.damage_dice else "1"
+                    damage_dice = (
+                        weapon.damage_dice
+                        if weapon and weapon.damage_dice and is_open5e_catalog_item(db, weapon)
+                        else "1d4"
+                    )
                     fixed_damage = damage_dice.isdigit()
                     rolled_damage = (
                         int(damage_dice)
@@ -2434,12 +2679,10 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     Inventory.character_id == character.id,
                     Item.item_type.like("weapon:%")
                 ).order_by(Item.name).all()
-                carried_weapons = [
-                    candidate for candidate in carried_weapons
-                    if is_open5e_catalog_item(db, candidate)
-                ]
                 requested_weapon = ai_result.get("weapon_name") if isinstance(ai_result, dict) else None
-                weapon = next(
+                weapon = None if _is_improvised_weapon_action(
+                    lower_action, carried_weapons
+                ) else next(
                     (
                         candidate for candidate in carried_weapons
                         if requested_weapon and candidate.name.casefold() == requested_weapon.casefold()
@@ -2511,7 +2754,8 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         damage_dice = (
                             weapon.damage_dice
                             if weapon and weapon.damage_dice
-                            else "1"  # SRD unarmed strike: fixed 1 + STR modifier below.
+                            and is_open5e_catalog_item(db, weapon)
+                            else "1d4"
                         )
                         fixed_damage = damage_dice.isdigit()
                         base_damage = int(damage_dice) if fixed_damage else _roll_entity_damage(damage_dice)
@@ -2535,6 +2779,15 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                             if npc_record:
                                 npc_record.is_alive = False
                         if not target.is_alive:
+                            failed_quests = _fail_quests_for_npc(
+                                db, character.group_id, target.name
+                            )
+                            if failed_quests:
+                                player_combat_text += (
+                                    "\n\n❌ Задания этого NPC провалены: "
+                                    + ", ".join(html.escape(title) for title in failed_quests)
+                                    + "."
+                                )
                             player_combat_text += (
                                 f"\n\n🎯 Ваш удар попадает: "
                                 f"{target.name} падает и больше не поднимается."
@@ -2878,8 +3131,8 @@ async def handle_action_description(message: types.Message, state: FSMContext):
             if scene_state and not (
                 isinstance(ai_result, dict) and ai_result.get("location_changed")
             ):
-                # A response that stays in place cannot silently relocate the
-                # shared party scene (especially when another member acts).
+                # A response that stays in place cannot silently relocate this
+                # character's scene based on another member's recent action.
                 new_scene_state = scene_state
             elif not new_scene_state:
                 new_scene_state = scene_state

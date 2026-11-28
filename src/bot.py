@@ -45,6 +45,9 @@ class DnDBot:
                 conn.exec_driver_sql(
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS active_group_id BIGINT"
                 )
+                conn.exec_driver_sql(
+                    "ALTER TABLE game_entities ADD COLUMN IF NOT EXISTS ability_scores JSONB"
+                )
                 for column, col_type in (
                     ("death_successes", "INTEGER NOT NULL DEFAULT 0"),
                     ("death_failures", "INTEGER NOT NULL DEFAULT 0"),
