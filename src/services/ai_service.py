@@ -386,12 +386,13 @@ Continuity is mandatory. Treat the supplied current scene and recent actions as 
 Do not teleport the character, change location, or assume an action in a different place
 has happened. If the requested action requires being somewhere else, explain in the
 narrative that the character is still in the current scene and ask them to move there first.
-In a group campaign, the scene state and recent actions are shared world canon for the
-whole party. Assume party members are together at the latest established location unless
-the shared history explicitly records that they split up. When one member moves the party,
-subsequent actions by other members start from that new shared location. Never place the
-same named character in two locations or use a different player's scene as if it were
-the current one. Do not invent a private, incompatible location for the acting player.
+In a group campaign, recent actions are shared world history, but each player character
+has their own location and agency. Use the acting character's current scene as authoritative;
+do not relocate them merely because another member moved. Do not assume a companion has
+followed, accepted an invitation, or joined a journey unless that player's own action
+confirms it. Never narrate another player character's dialogue, decision, consent,
+movement, or reaction. When invited, narrate only the invitation and leave the answer
+open for that player's controller.
 Update scene_state only for changes that actually happen in this action.
 Set location_changed=true only when the action successfully moves the character into a
 different distinct location, not for looking around or moving within the same room.

@@ -970,6 +970,15 @@ def _is_waiting_for_opponent(action: str) -> bool:
     ))
 
 
+def _is_party_invitation(action: str) -> bool:
+    return bool(re.search(
+        r"(приглаш\w*|позвал\w*|зову|пойд[её]м|пойти со мной|"
+        r"идти со мной|состав\w*\s+компан|следуй за мной|"
+        r"пойд[её]м вместе|пойд[её]м со мной)",
+        action.casefold()
+    ))
+
+
 def _is_looking_around(action: str) -> bool:
     return bool(re.search(
         r"\b(осмотр\w*|осматрива\w*|огляд\w*|look around|look over the area|survey the area)\b|"
@@ -1288,16 +1297,21 @@ async def handle_action_description(message: types.Message, state: FSMContext):
         from src.models import Group
         group = db.query(Group).filter(Group.id == character.group_id).first()
         world_desc = group.world_description if group else "Неизвестный мир"
-        # The campaign has one shared scene: movement by any party member
-        # changes the location seen by every other member.
+        # Keep each PC's position independent. Other members' actions remain
+        # shared context, but cannot relocate this character without their own
+        # explicit participation.
         recent_actions = db.query(ActionHistory).filter(
             ActionHistory.group_id == character.group_id
         ).order_by(ActionHistory.created_at.desc()).limit(8).all()
         recent_actions.reverse()
         scene_state = ""
-        if recent_actions:
+        personal_scene_action = db.query(ActionHistory).filter(
+            ActionHistory.character_id == character.id,
+            ActionHistory.group_id == character.group_id
+        ).order_by(ActionHistory.created_at.desc()).first()
+        if personal_scene_action:
             try:
-                latest_state = json.loads(recent_actions[-1].consequences or "{}")
+                latest_state = json.loads(personal_scene_action.consequences or "{}")
                 scene_state = latest_state.get("scene_state", "")
             except (json.JSONDecodeError, AttributeError):
                 # Older action history stored free-form consequences.
@@ -1454,6 +1468,28 @@ async def handle_action_description(message: types.Message, state: FSMContext):
             }
             for member in party_characters
         ]
+        other_party_members = [m for m in party_characters if m.id != character.id]
+        party_invitation = (
+            _is_party_invitation(action_description) and bool(other_party_members)
+        )
+        invitation_target = None
+        if party_invitation:
+            normalized_action = _normalize_entity_name(action_description)
+            for member in party_characters:
+                if member.id == character.id or not member.name:
+                    continue
+                name_tokens = [
+                    token for token in _normalize_entity_name(member.name).split()
+                    if len(token) >= 3
+                ]
+                if name_tokens and any(
+                    token in normalized_action.split() for token in name_tokens
+                ):
+                    invitation_target = member
+                    break
+            if invitation_target is None:
+                if len(other_party_members) == 1:
+                    invitation_target = other_party_members[0]
         for npc in campaign_npcs:
             memories = db.query(NPCMemory).filter(
                 NPCMemory.npc_id == npc.id
@@ -1621,6 +1657,38 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 )
                 await state.clear()
                 return
+
+            if party_invitation and isinstance(ai_result, dict):
+                # An invitation is not consent. Do not let the DM move, speak
+                # for, or create consequences for the invited player's PC.
+                invitation_text = (
+                    f"Вы приглашаете {invitation_target.name} отправиться с вами."
+                    if invitation_target
+                    else "Вы обращаетесь к товарищам с приглашением отправиться с вами."
+                )
+                ai_result.update({
+                    "narrative": (
+                        f"{invitation_text} "
+                        "Решение остаётся за игроком приглашённого персонажа; он "
+                        "может ответить собственным действием. Пока вы остаётесь на месте."
+                    ),
+                    "scene_state": scene_state,
+                    "location_changed": False,
+                    "entities": [],
+                    "npcs": [],
+                    "npc_memories": [],
+                    "quest_offers": [],
+                    "quest_completions": [],
+                    "loot": [],
+                    "custom_items": [],
+                    "custom_spells": [],
+                    "consumed_items": [],
+                    "currency": {"gold": 0, "silver": 0, "copper": 0},
+                    "damage": 0,
+                    "damage_dice": None,
+                    "target_name": None,
+                    "enemy_attacks": False,
+                })
 
             equipment_note = _apply_equipment_action(db, character, action_description)
             if equipment_note:
