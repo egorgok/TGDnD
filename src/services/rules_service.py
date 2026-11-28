@@ -10,55 +10,31 @@ logger = logging.getLogger(__name__)
 class RulesService:
     """Service for D&D 5e rules validation and reference"""
 
-    # Base D&D 5e races with ability modifiers
+    # D&D 5e 2024 species. Ability increases come from backgrounds, not species.
     RACES = {
-        "Человек": {
+        name: {
             "ability_mods": {
-                "str": 1, "dex": 1, "con": 1, "int": 1, "wis": 1, "cha": 1
+                "str": 0, "dex": 0, "con": 0,
+                "int": 0, "wis": 0, "cha": 0
             },
-            "hp_bonus": 0,
-            "starting_abilities": ["Универсальность"]
-        },
-        "Эльф": {
-            "ability_mods": {"str": 0, "dex": 2, "con": 0, "int": 0, "wis": 0, "cha": 0},
-            "hp_bonus": 0,
-            "starting_abilities": ["Острое восприятие", "Фейское происхождение", "Транс"]
-        },
-        "Дворф": {
-            "ability_mods": {"str": 0, "dex": 0, "con": 2, "int": 0, "wis": 1, "cha": 0},
-            "hp_bonus": 1,
-            "starting_abilities": ["Дварфийская устойчивость", "Дварфийское боевое мастерство"]
-        },
-        "Полурослик": {
-            "ability_mods": {"str": 0, "dex": 2, "con": 0, "int": 0, "wis": 0, "cha": 1},
-            "hp_bonus": 0,
-            "starting_abilities": ["Везунчик", "Храбрость", "Полуросликовая ловкость"]
-        },
-        "Драконорожденный": {
-            "ability_mods": {"str": 2, "dex": 0, "con": 1, "int": 0, "wis": 0, "cha": 1},
-            "hp_bonus": 0,
-            "starting_abilities": ["Драконье происхождение", "Дыхание"]
-        },
-        "Гном": {
-            "ability_mods": {"str": 0, "dex": 0, "con": 1, "int": 2, "wis": 0, "cha": 0},
-            "hp_bonus": 0,
-            "starting_abilities": ["Гномская хитрость"]
-        },
-        "Полуэльф": {
-            "ability_mods": {"str": 0, "dex": 0, "con": 0, "int": 0, "wis": 0, "cha": 2},
-            "hp_bonus": 0,
-            "starting_abilities": ["Фейское происхождение", "Универсальность навыков"]
-        },
-        "Полуорк": {
-            "ability_mods": {"str": 2, "dex": 0, "con": 1, "int": -2, "wis": 0, "cha": 0},
-            "hp_bonus": 1,
-            "starting_abilities": ["Угрожающий вид", "Неустанная стойкость"]
-        },
-        "Тифлинг": {
-            "ability_mods": {"str": 0, "dex": 0, "con": 0, "int": 1, "wis": 0, "cha": 2},
-            "hp_bonus": 0,
-            "starting_abilities": ["Адское сопротивление", "Врождённое колдовство"]
+            "hp_bonus": 1 if name == "Дварф" else 0,
+            "starting_abilities": [],
         }
+        for name in (
+            "Драконорождённый", "Дварф", "Эльф", "Гном", "Голиаф",
+            "Полурослик", "Человек", "Орк", "Тифлинг"
+        )
+    }
+    SPECIES_KEYS = {
+        "Драконорождённый": "dragonborn",
+        "Дварф": "dwarf",
+        "Эльф": "elf",
+        "Гном": "gnome",
+        "Голиаф": "goliath",
+        "Полурослик": "halfling",
+        "Человек": "human",
+        "Орк": "orc",
+        "Тифлинг": "tiefling",
     }
 
     # Base D&D 5e classes

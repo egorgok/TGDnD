@@ -49,8 +49,10 @@ class DnDBot:
                     "ALTER TABLE game_entities ADD COLUMN IF NOT EXISTS ability_scores JSONB"
                 )
                 for column, col_type in (
+                    ("background", "VARCHAR(100)"),
                     ("death_successes", "INTEGER NOT NULL DEFAULT 0"),
                     ("death_failures", "INTEGER NOT NULL DEFAULT 0"),
+                    ("lay_on_hands_remaining", "INTEGER"),
                     ("is_dead", "BOOLEAN NOT NULL DEFAULT FALSE"),
                 ):
                     conn.exec_driver_sql(
@@ -85,51 +87,20 @@ class DnDBot:
             logger.error(f"Error initializing database: {e}")
             raise
 
-        # Each deployment has its own database. Ensure the Open5e catalog is
-        # present there instead of relying on a developer machine's one-time import.
+        # The 2024 SRD snapshot is bundled locally from 5e-bits and is the
+        # sole rules edition used by game mechanics.
         try:
-            from src.models import DnDRules
             from src.models.base import SessionLocal
+            from src.services.srd2024_importer import sync_srd2024
 
-            db = SessionLocal()
+            srd_db = SessionLocal()
             try:
-                expected_counts = {
-                    "open5e_classes": 12,
-                    "open5e_spells": 100,
-                    "open5e_weapons": 20,
-                    "open5e_armor": 8,
-                    "open5e_items": 100,
-                    "open5e_creatures": 100,
-                    "open5e_rules": 100,
-                }
-                cache_is_ready = all(
-                    db.query(DnDRules.id).filter(
-                        DnDRules.rule_category == category
-                    ).count() >= minimum
-                    for category, minimum in expected_counts.items()
-                )
+                counts = await asyncio.to_thread(sync_srd2024, srd_db)
+                logger.info("Bundled 2024 SRD data loaded: %s", counts)
             finally:
-                db.close()
-
-            if not cache_is_ready:
-                logger.info("Open5e SRD cache is incomplete; synchronizing it now...")
-
-                def _sync_open5e_in_worker():
-                    from src.models.base import SessionLocal
-                    from src.services.open5e_importer import sync_open5e
-
-                    import_db = SessionLocal()
-                    try:
-                        return sync_open5e(import_db)
-                    finally:
-                        import_db.close()
-
-                counts = await asyncio.to_thread(_sync_open5e_in_worker)
-                logger.info("Open5e SRD cache synchronized: %s", counts)
+                srd_db.close()
         except Exception:
-            # Keep the bot usable during a temporary API/network outage. The
-            # importer can be rerun manually with `python -m src.services.open5e_importer`.
-            logger.exception("Open5e synchronization failed; continuing with cached/local rules")
+            logger.exception("Could not load bundled 2024 SRD; continuing with existing rules")
 
     async def on_startup(self):
         """Run on bot startup"""

@@ -5,14 +5,17 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy.orm import Session
 from src.models.base import SessionLocal
-from src.models import Character, User, Group, GroupMember
+from src.models import Character, User, Group, GroupMember, DnDRules
 from src.services import CharacterService, RulesService, GroupService
 from src.services.open5e_rules_service import (
     grant_starting_class_data,
+    grant_starting_species_data,
+    grant_starting_background_data,
     open5e_class_is_available
 )
 from src.utils import format_error, format_success
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -23,6 +26,8 @@ class CharacterCreationStates(StatesGroup):
     choosing_race = State()
     choosing_class = State()
     choosing_name = State()
+    choosing_background = State()
+    choosing_background_abilities = State()
     distributing_attributes = State()
     confirming = State()
 
@@ -162,7 +167,7 @@ async def create_character_command(message: types.Message, state: FSMContext):
 
         await message.answer(
             "🧙 <b>Создание персонажа</b>\n\n"
-            "Шаг 1: <b>Выбери расу</b>",
+            "Шаг 1: <b>Выбери вид персонажа (правила 2024)</b>",
             reply_markup=keyboard
         )
         await state.set_state(CharacterCreationStates.choosing_race)
@@ -177,12 +182,12 @@ async def create_character_command(message: types.Message, state: FSMContext):
 
 @router.callback_query(CharacterCreationStates.choosing_race, F.data.startswith("race_"))
 async def choose_race_callback(query: types.CallbackQuery, state: FSMContext):
-    """Handle race selection"""
+    """Handle 2024 species selection."""
     race = query.data.replace("race_", "")
 
     # Validate race
     if not RulesService.validate_race(race):
-        await query.answer("❌ Недействительная раса")
+        await query.answer("❌ Недействительный вид")
         return
 
     # Store race in context
@@ -199,7 +204,7 @@ async def choose_race_callback(query: types.CallbackQuery, state: FSMContext):
 
     await query.message.edit_text(
         f"🧙 <b>Создание персонажа</b>\n\n"
-        f"<b>Раса:</b> {race}\n\n"
+        f"<b>Вид:</b> {race}\n\n"
         f"Шаг 2: <b>Выбери класс</b>",
         reply_markup=keyboard
     )
@@ -225,7 +230,7 @@ async def choose_class_callback(query: types.CallbackQuery, state: FSMContext):
 
     await query.message.edit_text(
         f"🧙 <b>Создание персонажа</b>\n\n"
-        f"<b>Раса:</b> {race}\n"
+        f"<b>Вид:</b> {race}\n"
         f"<b>Класс:</b> {class_name}\n\n"
         f"Шаг 3: <b>Введи имя персонажа</b>\n\n"
         f"(Просто напишите имя в чат)",
@@ -249,35 +254,150 @@ async def choose_name_message(message: types.Message, state: FSMContext):
     class_name = data.get("class_")
 
     await state.update_data(name=name)
+    db: Session = SessionLocal()
+    try:
+        backgrounds = [
+            record for (record,) in db.query(DnDRules.rule_data).filter(
+                DnDRules.rule_category == "srd2024_backgrounds"
+            ).all()
+            if isinstance(record, dict)
+        ]
+        backgrounds.sort(
+            key=lambda record: str(
+                (record.get("localized_ru") or {}).get("name")
+                or record.get("name") or ""
+            ).casefold()
+        )
+        if not backgrounds:
+            await message.answer(
+                "❌ Предыстории SRD 2024 ещё не загружены. "
+                "Перезапустите бота и повторите создание персонажа."
+            )
+            await state.clear()
+            return
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=str(
+                        (background.get("localized_ru") or {}).get("name")
+                        or background.get("name")
+                    ),
+                    callback_data=f"background_{background.get('key') or background.get('index')}"
+                )
+            ]
+            for background in backgrounds
+        ])
+        await message.answer(
+            f"🧙 <b>Создание персонажа</b>\n\n"
+            f"<b>Вид:</b> {race}\n<b>Класс:</b> {class_name}\n"
+            f"<b>Имя:</b> {name}\n\n"
+            "Шаг 4: выберите предысторию SRD 2024.",
+            reply_markup=keyboard
+        )
+        await state.set_state(CharacterCreationStates.choosing_background)
+    finally:
+        db.close()
 
-    # Show attribute distribution screen
-    attributes_text = f"""
-🧙 <b>Создание персонажа</b>
 
-<b>Раса:</b> {race}
-<b>Класс:</b> {class_name}
-<b>Имя:</b> {name}
+@router.callback_query(
+    CharacterCreationStates.choosing_background,
+    F.data.startswith("background_")
+)
+async def choose_background_callback(query: types.CallbackQuery, state: FSMContext):
+    background_key = query.data.removeprefix("background_")
+    db: Session = SessionLocal()
+    try:
+        background = next(
+            (
+                record for (record,) in db.query(DnDRules.rule_data).filter(
+                    DnDRules.rule_category == "srd2024_backgrounds"
+                ).all()
+                if isinstance(record, dict)
+                and str(record.get("key") or record.get("index")) == background_key
+            ),
+            None
+        )
+        if not background:
+            await query.answer("Предыстория не найдена", show_alert=True)
+            return
+        localized = background.get("localized_ru") or {}
+        name = str(localized.get("name") or background.get("name") or background_key)
+        allowed_scores = localized.get("ability_scores") or background.get("ability_scores") or []
+        score_names = []
+        score_keys = []
+        for score in allowed_scores:
+            if not isinstance(score, dict):
+                continue
+            key = str(score.get("index") or "").casefold()
+            if key not in {"str", "dex", "con", "int", "wis", "cha"}:
+                continue
+            score_keys.append(key)
+            score_names.append(str(score.get("name") or key.upper()))
+        await state.update_data(
+            background_key=background_key,
+            background=name,
+            background_allowed_scores=score_keys
+        )
+        await query.message.edit_text(
+            f"<b>Предыстория:</b> {name}\n\n"
+            f"Доступные характеристики: {', '.join(score_names)}.\n"
+            "Выберите повышение характеристик из предыстории 2024: "
+            "например, <code>WIS+2, CHA+1</code> или три значения по +1."
+        )
+        await query.answer()
+        await state.set_state(CharacterCreationStates.choosing_background_abilities)
+    finally:
+        db.close()
 
-Шаг 4: <b>Распределение характеристик</b>
 
-Вы берете готовый набор чисел:
-<b>15, 14, 13, 12, 10, 8</b>
-
-И распределяете их между характеристиками:
-• <b>STR</b> (Сила) - боевые атаки, прыжки
-• <b>DEX</b> (Ловкость) - инициатива, защита
-• <b>CON</b> (Телосложение) - здоровье
-• <b>INT</b> (Интеллект) - знания, логика
-• <b>WIS</b> (Мудрость) - восприятие, магия
-• <b>CHA</b> (Харизма) - общение, влияние
-
-Напишите 6 чисел через запятую в порядке:
-STR, DEX, CON, INT, WIS, CHA
-
-Пример: 15, 14, 13, 12, 10, 8
-"""
-
-    await message.answer(attributes_text)
+@router.message(CharacterCreationStates.choosing_background_abilities)
+async def choose_background_abilities_message(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    allowed = set(data.get("background_allowed_scores") or [])
+    aliases = {
+        "сила": "str", "сил": "str", "str": "str", "strength": "str",
+        "ловкость": "dex", "лов": "dex", "dex": "dex", "dexterity": "dex",
+        "телосложение": "con", "тел": "con", "con": "con", "constitution": "con",
+        "интеллект": "int", "инт": "int", "int": "int", "intelligence": "int",
+        "мудрость": "wis", "муд": "wis", "мдр": "wis", "wis": "wis", "wisdom": "wis",
+        "харизма": "cha", "хар": "cha", "cha": "cha", "charisma": "cha",
+    }
+    parsed = re.findall(
+        r"([a-zа-яё]+)\s*\+\s*([12])",
+        (message.text or "").casefold()
+    )
+    bonuses = {}
+    for label, amount in parsed:
+        score = aliases.get(label)
+        if not score or score not in allowed or score in bonuses:
+            await message.answer(
+                "❌ Выберите характеристики только из списка предыстории, "
+                "без повторов. Пример: <code>WIS+2, CHA+1</code>."
+            )
+            return
+        bonuses[score] = int(amount)
+    valid = (
+        (len(bonuses) == 2 and sorted(bonuses.values()) == [1, 2])
+        or (len(bonuses) == 3 and all(amount == 1 for amount in bonuses.values()))
+    )
+    if not valid:
+        await message.answer(
+            "❌ Нужно распределить ровно +3: два значения +2 и +1 "
+            "или три разных значения по +1."
+        )
+        return
+    await state.update_data(background_bonuses=bonuses)
+    race = data.get("race")
+    class_name = data.get("class_")
+    name = data.get("name")
+    await message.answer(
+        f"🧙 <b>Создание персонажа</b>\n\n"
+        f"<b>Вид:</b> {race}\n<b>Класс:</b> {class_name}\n"
+        f"<b>Предыстория:</b> {data.get('background')}\n<b>Имя:</b> {name}\n\n"
+        "Шаг 5: распределите готовый набор чисел "
+        "<b>15, 14, 13, 12, 10, 8</b>.\n"
+        "Введите 6 чисел через запятую в порядке STR, DEX, CON, INT, WIS, CHA."
+    )
     await state.set_state(CharacterCreationStates.distributing_attributes)
 
 
@@ -315,9 +435,14 @@ async def distribute_attributes_message(message: types.Message, state: FSMContex
         race = data.get("race")
         class_name = data.get("class_")
         name = data.get("name")
+        background = data.get("background")
+        background_bonuses = data.get("background_bonuses") or {}
 
-        # Apply racial modifiers
+        # 2024 species do not grant fixed ability increases; the background does.
         final_attributes = RulesService.apply_ability_modifiers(attributes, race)
+        for score, amount in background_bonuses.items():
+            if score in final_attributes:
+                final_attributes[score] = min(20, final_attributes[score] + int(amount))
 
         await state.update_data(attributes=final_attributes)
 
@@ -325,16 +450,17 @@ async def distribute_attributes_message(message: types.Message, state: FSMContex
         race_info = RulesService.get_race_info(race)
         class_info = RulesService.get_class_info(class_name)
         con_mod = (final_attributes["con"] - 10) // 2
-        starting_hp = class_info["starting_hp"] + con_mod
+        starting_hp = class_info["starting_hp"] + con_mod + (race_info.get("hp_bonus", 0) if race_info else 0)
 
         confirmation_text = f"""
 🧙 <b>Подтверждение персонажа</b>
 
 <b>Имя:</b> {name}
-<b>Раса:</b> {race}
+<b>Вид:</b> {race}
 <b>Класс:</b> {class_name}
+<b>Предыстория:</b> {background}
 
-<b>📊 Характеристики (с модификаторами расы):</b>
+<b>📊 Характеристики (с бонусами предыстории 2024):</b>
 STR: {final_attributes['str']} ({(final_attributes['str']-10)//2:+d})
 DEX: {final_attributes['dex']} ({(final_attributes['dex']-10)//2:+d})
 CON: {final_attributes['con']} ({con_mod:+d})
@@ -370,6 +496,8 @@ async def confirm_create_callback(query: types.CallbackQuery, state: FSMContext)
         name = data.get("name")
         race = data.get("race")
         class_name = data.get("class_")
+        background = data.get("background")
+        background_key = data.get("background_key")
         attributes = data.get("attributes")
         selected_group_id = data.get("group_id")
 
@@ -396,16 +524,21 @@ async def confirm_create_callback(query: types.CallbackQuery, state: FSMContext)
 
         if not open5e_class_is_available(db, class_name):
             await query.message.edit_text(
-                "❌ Стартовые данные Open5e ещё не загружены.\n\n"
-                "Перезапустите бота, дождитесь завершения синхронизации правил "
-                "и нажмите «Создать» ещё раз. Персонаж пока не создан."
+                "❌ Данные класса из SRD 2024 ещё не загружены.\n\n"
+                "Перезапустите бота, дождитесь завершения импорта базы, "
+                "затем нажмите «Создать» ещё раз. Персонаж пока не создан."
             )
             await query.answer()
             return
 
         class_info = RulesService.get_class_info(class_name)
         con_modifier = (attributes["con"] - 10) // 2
-        starting_hp = class_info["starting_hp"] + con_modifier
+        species_info = RulesService.get_race_info(race)
+        starting_hp = (
+            class_info["starting_hp"]
+            + con_modifier
+            + (species_info.get("hp_bonus", 0) if species_info else 0)
+        )
 
         character = CharacterService.create_character(
             db=db,
@@ -415,7 +548,8 @@ async def confirm_create_callback(query: types.CallbackQuery, state: FSMContext)
             race=race,
             class_=class_name,
             attributes=attributes,
-            hp=starting_hp
+            hp=starting_hp,
+            background=background,
         )
 
         if character:
@@ -424,11 +558,18 @@ async def confirm_create_callback(query: types.CallbackQuery, state: FSMContext)
                 user.active_group_id = selected_group_id
                 db.commit()
             starting_data = grant_starting_class_data(db, character)
+            species_features = grant_starting_species_data(db, character)
+            background_data = grant_starting_background_data(
+                db, character, background_key
+            )
             await query.message.edit_text(
                 format_success(f"✅ Персонаж {name} создан успешно!\n\n")
                 + (
                     f"Стартовые особенности: {starting_data['features']}\n"
+                    f"Особенности вида: {species_features}\n"
+                    f"Особенности предыстории: {background_data['features']}\n"
                     f"Предметы: {starting_data['items']}\n"
+                    f"Предметы предыстории: {background_data['items']}\n"
                     f"Заклинания: {starting_data['spells']}\n\n"
                     "Используй /profile для просмотра листа персонажа"
                 )

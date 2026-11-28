@@ -28,12 +28,15 @@ def add_experience(db: Session, character: Character, amount: int) -> tuple[int,
     while character.level < 20 and character.experience >= XP_THRESHOLDS[character.level + 1]:
         character.level += 1
         levels.append(character.level)
+        if character.class_ == "Паладин" and character.lay_on_hands_remaining is not None:
+            character.lay_on_hands_remaining += 5
         attributes = db.query(CharacterAttribute).filter(
             CharacterAttribute.character_id == character.id
         ).first()
         con_modifier = (attributes.constitution - 10) // 2 if attributes else 0
         hit_die = CLASS_HIT_DICE.get(character.class_, 8)
-        hp_gain = max(1, (hit_die // 2 + 1) + con_modifier)
+        species_hp_bonus = 1 if character.race == "Дварф" else 0
+        hp_gain = max(1, (hit_die // 2 + 1) + con_modifier) + species_hp_bonus
         character.max_hp += hp_gain
         if character.current_hp > 0:
             character.current_hp += hp_gain
@@ -59,7 +62,8 @@ class CharacterService:
         race: str,
         class_: str,
         attributes: Dict[str, int],  # {str, dex, con, int, wis, cha}
-        hp: int
+        hp: int,
+        background: str | None = None,
     ) -> Optional[Character]:
         """Create a new character"""
         try:
@@ -82,6 +86,7 @@ class CharacterService:
                 name=name,
                 race=race,
                 class_=class_,
+                background=background,
                 max_hp=hp,
                 current_hp=hp,
                 level=1

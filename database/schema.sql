@@ -58,16 +58,21 @@ CREATE TABLE IF NOT EXISTS characters (
     name VARCHAR(255) NOT NULL,
     race VARCHAR(100) NOT NULL,
     class VARCHAR(100) NOT NULL,
+    background VARCHAR(100),
     level INT DEFAULT 1,
     max_hp INT NOT NULL,
     current_hp INT NOT NULL,
     experience INT DEFAULT 0,
     death_successes INT NOT NULL DEFAULT 0,
     death_failures INT NOT NULL DEFAULT 0,
+    lay_on_hands_remaining INT,
     is_dead BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE characters ADD COLUMN IF NOT EXISTS lay_on_hands_remaining INT;
+ALTER TABLE characters ADD COLUMN IF NOT EXISTS background VARCHAR(100);
 
 -- Character attributes (STR, DEX, CON, INT, WIS, CHA)
 CREATE TABLE IF NOT EXISTS character_attributes (

@@ -64,7 +64,7 @@ async def profile_command(message: types.Message):
         inventory = InventoryService.get_inventory(db, character.id)
         abilities = db.query(CharacterAbility).filter(
             CharacterAbility.character_id == character.id,
-            CharacterAbility.is_class.is_(True)
+            ~CharacterAbility.ability_name.startswith("__")
         ).all()
         spells = db.query(CharacterSpell).filter(
             CharacterSpell.character_id == character.id
@@ -83,8 +83,9 @@ async def profile_command(message: types.Message):
 <b>⚔️ {character.name}</b>
 
 <b>📋 Основная информация:</b>
-Раса: {character.race}
+Вид: {character.race}
 Класс: {character.class_}
+Предыстория: {character.background or '—'}
 Уровень: {character.level}
 Опыт: {character.experience or 0}{f" / {xp_target}" if xp_target else " (максимум)"}
 
@@ -114,9 +115,14 @@ async def profile_command(message: types.Message):
             profile_text += "\nПуст"
 
         if abilities:
-            profile_text += "\n\n<b>✨ Особенности класса:</b>"
+            profile_text += "\n\n<b>✨ Особенности и владения:</b>"
             for ability in abilities:
-                profile_text += f"\n• <b>{ability.ability_name}</b>"
+                category = (
+                    "🧬" if ability.is_racial
+                    else "⚔️" if ability.is_class
+                    else "🌟"
+                )
+                profile_text += f"\n{category} <b>{ability.ability_name}</b>"
                 description = localized_feature_description(
                     ability.ability_name,
                     ability.ability_description or ""
