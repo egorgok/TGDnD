@@ -256,6 +256,7 @@ Is this action possible? What are the consequences?"""
         recent_actions: Optional[list] = None,
         known_entities: Optional[list] = None,
         known_npcs: Optional[list] = None,
+        party_members: Optional[list] = None,
         currency: Optional[dict] = None,
         rules_context: Optional[str] = None,
         creature_catalog: Optional[str] = None,
@@ -385,6 +386,12 @@ Continuity is mandatory. Treat the supplied current scene and recent actions as 
 Do not teleport the character, change location, or assume an action in a different place
 has happened. If the requested action requires being somewhere else, explain in the
 narrative that the character is still in the current scene and ask them to move there first.
+In a group campaign, the scene state and recent actions are shared world canon for the
+whole party. Assume party members are together at the latest established location unless
+the shared history explicitly records that they split up. When one member moves the party,
+subsequent actions by other members start from that new shared location. Never place the
+same named character in two locations or use a different player's scene as if it were
+the current one. Do not invent a private, incompatible location for the acting player.
 Update scene_state only for changes that actually happen in this action.
 Set location_changed=true only when the action successfully moves the character into a
 different distinct location, not for looking around or moving within the same room.
@@ -406,6 +413,14 @@ named or noteworthy person/creature that can be interacted with, record their id
 and narrative details. Give a creature combat stats only when you can provide an exact
 matching Open5e/API key; never generate plausible replacement stats. For unclear
 references like "him", choose a target only if exactly one known entity is present.
+The party members listed below are real player characters, not NPCs. Never create an
+NPC, monster, entity, portrait, quest target, or separate identity with one of their
+names. If the player says to take, call, follow, help, or travel with one of them,
+refer to that existing companion instead of spawning a new person.
+Player characters are controlled by real players. They may attack one another when a
+player explicitly chooses a player character as the target. Do not block or deflect an
+explicit PvP action; narrate the declared attempt without deciding its mechanical hit,
+miss, or damage, which the game resolves.
 Make the world feel populated with purposes: when a non-hostile named NPC is first met,
 you MUST give them a fitting quest, favor, lead, or request unless they are clearly
 incapable of offering one. Check known NPC quest history first and never repeat an offer
@@ -476,6 +491,7 @@ Current scene state: {scene_state or "Not established yet; establish a plausible
 Recent actions and outcomes: {recent_actions or []}
 Known entities and their current stats: {known_entities or []}
 Campaign NPC registry and factual memories: {known_npcs or []}
+Actual player companions in this campaign (never NPCs): {party_members or []}
 Open5e SRD 5.1 creature index (use exact key for a matching monster):
 {creature_catalog or "No creature index imported."}
 Imported Open5e 5e-2014 SRD rules and this character's actual abilities/equipment:

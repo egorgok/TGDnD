@@ -6,7 +6,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedIn
 from sqlalchemy.orm import Session
 from src.models.base import SessionLocal
 from src.models import (
-    Character, CharacterAttribute, CharacterSpell, Inventory, Item, ActionHistory, GameSession,
+    Character, CharacterAttribute, CharacterAbility, CharacterSpell, Inventory, Item, ActionHistory, GameSession,
     Location, LocationConnection, CombatEncounter, CombatParticipant, GameEntity,
     CampaignNPC, NPCMemory, DnDRules, CharacterCurrency, CampaignQuest
 )
@@ -675,6 +675,42 @@ def _official_combat_profile(record: dict) -> Optional[dict]:
     }
 
 
+_CREATURE_ARCHETYPE_KEYS = {
+    "разбойник": ("bandit", "thug"),
+    "бандит": ("bandit", "thug"),
+    "разбойники": ("bandit", "thug"),
+    "страж": ("guard",),
+    "стражник": ("guard",),
+    "солдат": ("guard", "veteran"),
+    "гоблин": ("goblin",),
+    "орк": ("orc",),
+    "волк": ("wolf",),
+    "скелет": ("skeleton",),
+    "зомби": ("zombie",),
+    "паук": ("giant-spider",),
+}
+
+
+def _official_archetype_data(db: Session, name: str, entity_type: str) -> tuple[Optional[dict], Optional[str]]:
+    """Find a real imported Open5e creature to use as a generic archetype."""
+    text = _normalize_entity_name(f"{name} {entity_type}")
+    for marker, keys in _CREATURE_ARCHETYPE_KEYS.items():
+        if _normalize_entity_name(marker) not in text:
+            continue
+        for key in keys:
+            record = _official_creature_data(db, key, "")
+            if record:
+                return record, str(record.get("key") or key)
+    # A hostile unnamed humanoid is most safely represented by the imported
+    # bandit profile rather than by AI-invented numbers.
+    if any(marker in text.split() for marker in ("person", "humanoid", "человек", "гуманоид", "unknown", "неизвестный")):
+        for key in ("bandit", "guard"):
+            record = _official_creature_data(db, key, "")
+            if record:
+                return record, str(record.get("key") or key)
+    return None, None
+
+
 DAMAGE_TYPES_RU = {
     "bludgeoning": "дробящий", "дробящий": "дробящий",
     "piercing": "колющий", "колющий": "колющий",
@@ -961,6 +997,14 @@ def _is_arena_setting(setting: str) -> bool:
     return bool(re.search(r"арен|гладиатор|колиз|colosseum|gladiator", setting.lower()))
 
 
+def _player_names_in_group(db: Session, group_id: int) -> set[str]:
+    return {
+        character.name.casefold().strip()
+        for character in db.query(Character).filter(Character.group_id == group_id).all()
+        if character.name
+    }
+
+
 @router.message(Command("inspect"))
 async def inspect_entity_command(message: types.Message):
     """Inspect known people and creatures, optionally by name."""
@@ -974,8 +1018,85 @@ async def inspect_entity_command(message: types.Message):
         npcs = db.query(CampaignNPC).filter(
             CampaignNPC.group_id == character.group_id
         ).order_by(CampaignNPC.last_seen_at.desc()).all()
+        companions = db.query(Character).filter(
+            Character.group_id == character.group_id,
+            Character.id != character.id
+        ).order_by(Character.name).all()
         query_name = (message.text or "").partition(" ")[2].strip()
         if query_name:
+            companion = next(
+                (
+                    candidate for candidate in companions
+                    if candidate.name.casefold() == query_name.casefold()
+                ),
+                None
+            )
+            if companion:
+                attributes = db.query(CharacterAttribute).filter(
+                    CharacterAttribute.character_id == companion.id
+                ).first()
+                armor_class = GameEngineService.calculate_armor_class(
+                    companion, attributes, db
+                )
+                purse = db.query(CharacterCurrency).filter(
+                    CharacterCurrency.character_id == companion.id
+                ).first()
+                inventory = InventoryService.get_inventory(db, companion.id)
+                abilities = db.query(CharacterAbility).filter(
+                    CharacterAbility.character_id == companion.id,
+                    CharacterAbility.is_class.is_(True)
+                ).all()
+                spells = db.query(CharacterSpell).filter(
+                    CharacterSpell.character_id == companion.id
+                ).order_by(CharacterSpell.spell_level, CharacterSpell.spell_name).all()
+                if attributes:
+                    stats = (
+                        f"СИЛ {attributes.strength} ({(attributes.strength - 10)//2:+d}) · "
+                        f"ЛОВ {attributes.dexterity} ({(attributes.dexterity - 10)//2:+d}) · "
+                        f"ТЕЛ {attributes.constitution} ({(attributes.constitution - 10)//2:+d})\n"
+                        f"ИНТ {attributes.intelligence} ({(attributes.intelligence - 10)//2:+d}) · "
+                        f"МДР {attributes.wisdom} ({(attributes.wisdom - 10)//2:+d}) · "
+                        f"ХАР {attributes.charisma} ({(attributes.charisma - 10)//2:+d})"
+                    )
+                else:
+                    stats = "Характеристики не указаны."
+                inventory_text = "\n".join(
+                    f"{'✓' if row['is_equipped'] else '•'} {html.escape(row['item'].name)} x{row['quantity']}"
+                    for row in inventory if row.get("item")
+                ) or "Пуст"
+                ability_text = "\n".join(
+                    f"• {html.escape(ability.ability_name)}"
+                    for ability in abilities
+                ) or "Нет"
+                spell_text = "\n".join(
+                    f"{'✓' if not (spell.slots_used or 0) else '•'} "
+                    f"{html.escape(spell.spell_name)} "
+                    f"({'заговор' if spell.spell_level == 0 else f'{spell.spell_level} ур.'})"
+                    for spell in spells
+                ) or "Нет"
+                status = "☠️ Погиб" if companion.is_dead else (
+                    "🩸 При смерти" if companion.current_hp <= 0 else "❤️ Здоров"
+                )
+                await message.answer(
+                    f"<b>⚔️ {html.escape(companion.name)}</b>\n\n"
+                    f"<b>Раса:</b> {html.escape(companion.race)}\n"
+                    f"<b>Класс:</b> {html.escape(companion.class_)}\n"
+                    f"<b>Уровень:</b> {companion.level} · "
+                    f"<b>Опыт:</b> {companion.experience or 0}\n"
+                    f"<b>Состояние:</b> {status}\n"
+                    f"<b>HP:</b> {companion.current_hp}/{companion.max_hp}\n"
+                    f"<b>КД:</b> {armor_class}\n"
+                    f"<b>Кошелёк:</b> {purse.gold if purse else 0} зм · "
+                    f"{purse.silver if purse else 0} см · {purse.copper if purse else 0} мм\n\n"
+                    f"<b>📊 Характеристики:</b>\n{stats}\n\n"
+                    f"<b>🎒 Инвентарь:</b>\n{inventory_text}\n\n"
+                    f"<b>✨ Особенности класса:</b>\n{ability_text}\n\n"
+                    f"<b>🔮 Заклинания:</b>\n{spell_text}",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]
+                    ])
+                )
+                return
             npc = next(
                 (candidate for candidate in npcs if candidate.name.casefold() == query_name.casefold()),
                 None
@@ -1014,8 +1135,21 @@ async def inspect_entity_command(message: types.Message):
                     [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]
                 ])
             )
-        elif npcs:
-            lines = ["<b>Знакомые люди и существа:</b>"]
+        elif npcs or companions:
+            lines = []
+            if companions:
+                lines.append("<b>🤝 Товарищи:</b>")
+                for companion in companions:
+                    status = "погиб" if companion.is_dead else (
+                        "при смерти" if companion.current_hp <= 0 else "жив"
+                    )
+                    lines.append(
+                        f"• {html.escape(companion.name)} — "
+                        f"{html.escape(companion.race)} {html.escape(companion.class_)}, {status}"
+                    )
+                lines.append("")
+            if npcs:
+                lines.append("<b>Знакомые люди и существа:</b>")
             for npc in npcs:
                 status = "жив" if npc.is_alive else "погиб"
                 has_quest = db.query(CampaignQuest.id).filter(
@@ -1035,7 +1169,7 @@ async def inspect_entity_command(message: types.Message):
             )
         else:
             await message.answer(
-                "Вы пока не встречали людей или существ, которых можно осмотреть.",
+                "Вы пока не встречали товарищей, людей или существ, которых можно осмотреть.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="🎮 В меню", callback_data="main_menu")]
                 ])
@@ -1154,8 +1288,10 @@ async def handle_action_description(message: types.Message, state: FSMContext):
         from src.models import Group
         group = db.query(Group).filter(Group.id == character.group_id).first()
         world_desc = group.world_description if group else "Неизвестный мир"
+        # The campaign has one shared scene: movement by any party member
+        # changes the location seen by every other member.
         recent_actions = db.query(ActionHistory).filter(
-            ActionHistory.character_id == character.id
+            ActionHistory.group_id == character.group_id
         ).order_by(ActionHistory.created_at.desc()).limit(8).all()
         recent_actions.reverse()
         scene_state = ""
@@ -1171,7 +1307,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
         arena_opponent = None
         if _is_arena_setting(world_desc) and _is_waiting_for_opponent(action_description):
             active_opponent = db.query(GameEntity).filter(
-                GameEntity.character_id == character.id,
+                GameEntity.group_id == character.group_id,
                 GameEntity.is_alive.is_(True),
                 GameEntity.is_hostile.is_(True)
             ).first()
@@ -1231,6 +1367,11 @@ async def handle_action_description(message: types.Message, state: FSMContext):
 
         recent_context = [
             {
+                "character": (
+                    db.query(Character.name).filter(
+                        Character.id == entry.character_id
+                    ).scalar() or "Персонаж"
+                ),
                 "action": entry.action_description,
                 "outcome": (entry.ai_response or "")[:500],
                 "roll": entry.dice_roll
@@ -1238,7 +1379,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
             for entry in recent_actions
         ]
         entities = db.query(GameEntity).filter(
-            GameEntity.character_id == character.id
+            GameEntity.group_id == character.group_id
         ).all()
         for entity in entities:
             npc = db.query(CampaignNPC).filter(
@@ -1293,6 +1434,26 @@ async def handle_action_description(message: types.Message, state: FSMContext):
         ).order_by(CampaignNPC.last_seen_at.desc()).limit(30).all()
         existing_npc_names = {npc.name.casefold() for npc in campaign_npcs}
         npc_context = []
+        party_characters = db.query(Character).filter(
+            Character.group_id == character.group_id
+        ).order_by(Character.name).all()
+        player_names = _player_names_in_group(db, character.group_id)
+        party_name_to_character = {
+            member.name.casefold().strip(): member
+            for member in party_characters
+            if member.name and member.id != character.id
+        }
+        party_members_context = [
+            {
+                "name": member.name,
+                "race": member.race,
+                "class": member.class_,
+                "hp": f"{member.current_hp}/{member.max_hp}",
+                "alive": not member.is_dead and member.current_hp > 0,
+                "is_self": member.id == character.id,
+            }
+            for member in party_characters
+        ]
         for npc in campaign_npcs:
             memories = db.query(NPCMemory).filter(
                 NPCMemory.npc_id == npc.id
@@ -1403,6 +1564,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 recent_actions=recent_context,
                 known_entities=entity_context,
                 known_npcs=npc_context,
+                party_members=party_members_context,
                 rules_context=build_dm_rules_context(db, character, action_description),
                 creature_catalog=build_creature_catalog(db),
                 item_catalog=build_item_catalog(db),
@@ -1501,7 +1663,11 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     if not isinstance(npc_data, dict):
                         continue
                     npc_name = str(npc_data.get("name") or "").strip()
-                    if npc_name and npc_name.casefold() not in existing_npc_names:
+                    if (
+                        npc_name
+                        and npc_name.casefold() not in existing_npc_names
+                        and npc_name.casefold() not in player_names
+                    ):
                         new_npc_for_image = npc_data
                         break
                 if new_npc_for_image is None:
@@ -1509,7 +1675,11 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         if not isinstance(found_entity, dict) or found_entity.get("is_hostile"):
                             continue
                         npc_name = str(found_entity.get("name") or "").strip()
-                        if npc_name and npc_name.casefold() not in existing_npc_names:
+                        if (
+                            npc_name
+                            and npc_name.casefold() not in existing_npc_names
+                            and npc_name.casefold() not in player_names
+                        ):
                             new_npc_for_image = found_entity
                             break
             if arena_event_text:
@@ -1518,8 +1688,12 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 name = str(found_entity.get("name", "")).strip()[:255]
                 if not name:
                     continue
+                # A player character can be mentioned by the DM, but can never
+                # be persisted as a second NPC/entity.
+                if name.casefold() in player_names:
+                    continue
                 existing_entity = db.query(GameEntity).filter(
-                    GameEntity.character_id == character.id,
+                    GameEntity.group_id == character.group_id,
                     GameEntity.name.ilike(name)
                 ).first()
                 if existing_entity:
@@ -1540,28 +1714,44 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     open5e_key = str(official.get("key") or "").strip()
                 combat_profile = _official_combat_profile(official) if official else None
                 if requires_api_profile and not combat_profile:
-                    # Keep the identity in campaign memory, but never create a
-                    # combat target with AI-invented/defaulted statistics.
-                    unsupported_npc = db.query(CampaignNPC).filter(
-                        CampaignNPC.group_id == character.group_id,
-                        CampaignNPC.name.ilike(name)
-                    ).first()
-                    if not unsupported_npc:
-                        db.add(CampaignNPC(
-                            group_id=character.group_id,
-                            name=name,
-                            role=entity_type[:255],
-                            description=str(found_entity.get("description") or "")[:4000],
-                            personality=str(found_entity.get("personality") or "")[:2000],
-                            current_location=scene_state[:500] or None,
-                            is_hostile=is_hostile_entity,
-                            is_alive=True
-                        ))
-                    narrative += (
-                        f"\n\n⚠️ Для {name} не найден полный боевой блок в загруженных "
-                        "данных Open5e, поэтому его боевые характеристики не выдумываются."
+                    # Use only an imported Open5e creature as a generic archetype
+                    # (e.g. an unnamed hostile person becomes a bandit/guard).
+                    official, archetype_key = _official_archetype_data(
+                        db, name, entity_type
                     )
-                    continue
+                    combat_profile = (
+                        _official_combat_profile(official) if official else None
+                    )
+                    if combat_profile:
+                        open5e_key = archetype_key
+                        narrative += (
+                            f"\n\nСущество распознано как типичный архетип "
+                            f"«{entity_type}»."
+                        )
+                    else:
+                        # Keep the identity in campaign memory, but do not create
+                        # a combat target with AI-invented/defaulted statistics.
+                        unsupported_npc = db.query(CampaignNPC).filter(
+                            CampaignNPC.group_id == character.group_id,
+                            CampaignNPC.name.ilike(name)
+                        ).first()
+                        if not unsupported_npc:
+                            db.add(CampaignNPC(
+                                group_id=character.group_id,
+                                name=name,
+                                role=entity_type[:255],
+                                description=str(found_entity.get("description") or "")[:4000],
+                                personality=str(found_entity.get("personality") or "")[:2000],
+                                current_location=scene_state[:500] or None,
+                                is_hostile=is_hostile_entity,
+                                is_alive=True
+                            ))
+                        narrative += (
+                            f"\n\n⚠️ Для {name} не найден подтверждённый боевой "
+                            "архетип в Open5e/API, поэтому числовой бой с ним пока "
+                            "не разрешён."
+                        )
+                        continue
                 if combat_profile:
                     max_hp = combat_profile["max_hp"]
                     armor_class = combat_profile["armor_class"]
@@ -1632,6 +1822,8 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     npc_name = str(npc_data.get("name", "")).strip()[:255]
                     if not npc_name:
                         continue
+                    if npc_name.casefold() in player_names:
+                        continue
                     npc = db.query(CampaignNPC).filter(
                         CampaignNPC.group_id == character.group_id,
                         CampaignNPC.name.ilike(npc_name)
@@ -1657,6 +1849,8 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     fact = str(memory_data.get("fact", "")).strip()[:2000]
                     if not npc_name or not fact:
                         continue
+                    if npc_name.casefold() in player_names:
+                        continue
                     npc = db.query(CampaignNPC).filter(
                         CampaignNPC.group_id == character.group_id,
                         CampaignNPC.name.ilike(npc_name)
@@ -1680,6 +1874,8 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     title = str(offer.get("title") or "").strip()[:255]
                     description = str(offer.get("description") or "").strip()[:2000]
                     if not npc_name or not title or not description:
+                        continue
+                    if npc_name.casefold() in player_names:
                         continue
                     npc = db.query(CampaignNPC).filter(
                         CampaignNPC.group_id == character.group_id,
@@ -1949,22 +2145,44 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 db.flush()
 
             target_name = ai_result.get("target_name") if isinstance(ai_result, dict) else None
+            lower_action = action_description.casefold()
+            if not target_name and _is_aggressive_action(action_description):
+                # The model may omit target_name for declined/ambiguous PvP.
+                # Recover a directly named party target from the player's text.
+                for party_name in party_name_to_character:
+                    name_tokens = [
+                        token for token in party_name.split() if len(token) >= 3
+                    ]
+                    if name_tokens and any(
+                        token in lower_action for token in name_tokens
+                    ):
+                        target_name = party_name
+                        break
             target = None
+            named_party_target = bool(
+                target_name and target_name.casefold().strip() in player_names
+            )
+            party_target = None
             if target_name:
-                target = db.query(GameEntity).filter(
-                    GameEntity.character_id == character.id,
-                    GameEntity.name.ilike(target_name),
-                    GameEntity.is_alive.is_(True)
-                ).first()
+                if named_party_target:
+                    party_target = db.query(Character).filter(
+                        Character.group_id == character.group_id,
+                        Character.name.ilike(target_name)
+                    ).first()
+                else:
+                    target = db.query(GameEntity).filter(
+                        GameEntity.group_id == character.group_id,
+                        GameEntity.name.ilike(target_name),
+                        GameEntity.is_alive.is_(True)
+                    ).first()
 
-            lower_action = action_description.lower()
             is_attack_action = _is_aggressive_action(action_description)
             enemy_attacks = bool(
                 isinstance(ai_result, dict) and ai_result.get("enemy_attacks")
             )
-            if target is None and (is_attack_action or enemy_attacks):
+            if target is None and party_target is None and (is_attack_action or enemy_attacks):
                 living_entities = db.query(GameEntity).filter(
-                    GameEntity.character_id == character.id,
+                    GameEntity.group_id == character.group_id,
                     GameEntity.is_alive.is_(True)
                 ).all()
                 if len(living_entities) == 1:
@@ -2053,6 +2271,94 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                     )
 
             player_combat_text = ""
+            if is_attack_action and party_target and party_target.id != character.id:
+                # Player characters use their real sheet (including calculated
+                # AC/HP), not a fabricated GameEntity/Open5e monster block.
+                carried_weapons = db.query(Item).join(
+                    Inventory, Inventory.item_id == Item.id
+                ).filter(
+                    Inventory.character_id == character.id,
+                    Item.item_type.like("weapon:%")
+                ).order_by(Item.name).all()
+                carried_weapons = [
+                    candidate for candidate in carried_weapons
+                    if is_open5e_catalog_item(db, candidate)
+                ]
+                requested_weapon = (
+                    ai_result.get("weapon_name") if isinstance(ai_result, dict) else None
+                )
+                weapon = next(
+                    (
+                        candidate for candidate in carried_weapons
+                        if requested_weapon
+                        and candidate.name.casefold() == requested_weapon.casefold()
+                    ),
+                    None
+                ) or _choose_weapon(carried_weapons, lower_action)
+                weapon_type = weapon.item_type if weapon else "weapon:unarmed"
+                attacker_attributes = db.query(CharacterAttribute).filter(
+                    CharacterAttribute.character_id == character.id
+                ).first()
+                defender_attributes = db.query(CharacterAttribute).filter(
+                    CharacterAttribute.character_id == party_target.id
+                ).first()
+                strength_modifier = (
+                    (attacker_attributes.strength - 10) // 2 if attacker_attributes else 0
+                )
+                dexterity_modifier = (
+                    (attacker_attributes.dexterity - 10) // 2 if attacker_attributes else 0
+                )
+                is_ranged_weapon = ":ranged" in weapon_type
+                ability_modifier = (
+                    max(strength_modifier, dexterity_modifier)
+                    if ":finesse" in weapon_type
+                    else dexterity_modifier if is_ranged_weapon
+                    else strength_modifier
+                )
+                attack_bonus = (
+                    ability_modifier
+                    + GameEngineService.calculate_proficiency_bonus(character.level)
+                )
+                attack_roll = GameEngineService.roll_d20()
+                attack_total = attack_roll + attack_bonus
+                target_ac = GameEngineService.calculate_armor_class(
+                    party_target, defender_attributes, db
+                )
+                if attack_roll == 20 or (attack_roll != 1 and attack_total >= target_ac):
+                    damage_dice = weapon.damage_dice if weapon and weapon.damage_dice else "1"
+                    fixed_damage = damage_dice.isdigit()
+                    rolled_damage = (
+                        int(damage_dice)
+                        if fixed_damage
+                        else _roll_entity_damage(damage_dice)
+                    )
+                    if attack_roll == 20 and not fixed_damage:
+                        rolled_damage += _roll_entity_damage(damage_dice)
+                    dealt_damage = max(
+                        1,
+                        rolled_damage + (
+                            ability_modifier if not fixed_damage or weapon is None else 0
+                        )
+                    )
+                    old_target_hp = party_target.current_hp
+                    party_target.current_hp = max(0, old_target_hp - dealt_damage)
+                    if party_target.current_hp <= 0:
+                        party_target.death_successes = 0
+                        party_target.death_failures = 0
+                    player_combat_text = (
+                        f"\n\n⚔️ PvP: атака по {html.escape(party_target.name)} — "
+                        f"d20 ({attack_roll}) + {attack_bonus} = {attack_total} "
+                        f"против КД {target_ac}: попадание. "
+                        f"Урон {dealt_damage}; HP цели "
+                        f"{party_target.current_hp}/{party_target.max_hp}."
+                    )
+                else:
+                    player_combat_text = (
+                        f"\n\n⚔️ PvP: атака по {html.escape(party_target.name)} — "
+                        f"d20 ({attack_roll}) + {attack_bonus} = {attack_total} "
+                        f"против КД {target_ac}: промах."
+                    )
+
             if is_attack_action and target:
                 carried_weapons = db.query(Item).join(
                     Inventory, Inventory.item_id == Item.id
@@ -2310,7 +2616,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
             # hostile combatant in reach gets exactly one response, in DEX order.
             # Do not rely on the model's enemy_attacks flag for turn advancement.
             hostiles = db.query(GameEntity).filter(
-                GameEntity.character_id == character.id,
+                GameEntity.group_id == character.group_id,
                 GameEntity.is_alive.is_(True),
                 GameEntity.is_hostile.is_(True)
             ).order_by(GameEntity.id).all()
@@ -2501,6 +2807,14 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                 )
 
             new_scene_state = ai_result.get("scene_state", "") if isinstance(ai_result, dict) else ""
+            if scene_state and not (
+                isinstance(ai_result, dict) and ai_result.get("location_changed")
+            ):
+                # A response that stays in place cannot silently relocate the
+                # shared party scene (especially when another member acts).
+                new_scene_state = scene_state
+            elif not new_scene_state:
+                new_scene_state = scene_state
 
             history_entry = ActionHistory(
                 group_id=character.group_id,
@@ -2515,7 +2829,7 @@ async def handle_action_description(message: types.Message, state: FSMContext):
                         {"name": entity.name, "hp": entity.current_hp, "alive": entity.is_alive,
                          "distance_m": entity.distance_m}
                         for entity in db.query(GameEntity).filter(
-                            GameEntity.character_id == character.id
+                            GameEntity.group_id == character.group_id
                         ).all()
                     ]
                 }, ensure_ascii=False)

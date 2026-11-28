@@ -111,6 +111,12 @@ async def create_group_character_callback(query: types.CallbackQuery, state: FSM
 @router.message(Command("create_character"))
 async def create_character_command(message: types.Message, state: FSMContext):
     """Start character creation process"""
+    if message.chat.type in {"group", "supergroup"}:
+        await message.answer(
+            "❌ Персонажей можно создавать только в личном чате с ботом.\n"
+            "Откройте личный чат и выберите нужный сеттинг через /menu."
+        )
+        return
     db: Session = SessionLocal()
     try:
         user = db.query(User).filter(User.id == message.from_user.id).first()
