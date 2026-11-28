@@ -289,6 +289,25 @@ def _class_record(db: Session, class_name: str) -> dict | None:
     return None
 
 
+def character_class_features(db: Session, character) -> list[dict]:
+    """Return current-level class features from the 2024 SRD for sheet display."""
+    class_record = _class_record(db, character.class_)
+    if not class_record:
+        return []
+    features = []
+    for feature in class_record.get("features", []):
+        if not isinstance(feature, dict) or feature.get("feature_type") == "STARTING_EQUIPMENT":
+            continue
+        gained_at = feature.get("gained_at") or []
+        if any(
+            isinstance(level, dict)
+            and int(level.get("level") or 0) <= int(character.level or 1)
+            for level in gained_at
+        ):
+            features.append(feature)
+    return features
+
+
 def open5e_class_is_available(db: Session, class_name: str) -> bool:
     record = _class_record(db, class_name)
     return bool(

@@ -13,7 +13,10 @@ from src.services.open5e_localization import localized_feature_description
 from src.services.inventory_service import InventoryService
 from src.services.character_service import xp_for_next_level
 from src.services.campaign_context import resolve_group, resolve_character
-from src.services.open5e_rules_service import repair_srd2024_feature_descriptions
+from src.services.open5e_rules_service import (
+    character_class_features,
+    repair_srd2024_feature_descriptions,
+)
 from src.utils import format_error
 import logging
 
@@ -117,21 +120,45 @@ async def profile_command(message: types.Message):
         else:
             profile_text += "\nПуст"
 
-        if abilities:
-            profile_text += "\n\n<b>✨ Особенности и владения:</b>"
-            for ability in abilities:
-                category = (
+        profile_text += "\n\n<b>🗡️ Способности и особенности:</b>"
+        displayed_features = [
+            {
+                "name": ability.ability_name,
+                "description": ability.ability_description or "",
+                "category": (
                     "🧬" if ability.is_racial
                     else "⚔️" if ability.is_class
                     else "🌟"
-                )
-                profile_text += f"\n{category} <b>{ability.ability_name}</b>"
+                ),
+            }
+            for ability in abilities
+        ]
+        seen_feature_names = {
+            item["name"].casefold().replace("ё", "е")
+            for item in displayed_features
+        }
+        for feature in character_class_features(db, character):
+            feature_name = str(feature.get("name") or "").strip()
+            normalized_name = feature_name.casefold().replace("ё", "е")
+            if not feature_name or normalized_name in seen_feature_names:
+                continue
+            displayed_features.append({
+                "name": feature_name,
+                "description": str(feature.get("desc") or ""),
+                "category": "⚔️",
+            })
+            seen_feature_names.add(normalized_name)
+        if displayed_features:
+            for feature in displayed_features:
+                profile_text += f"\n{feature['category']} <b>{feature['name']}</b>"
                 description = localized_feature_description(
-                    ability.ability_name,
-                    ability.ability_description or ""
+                    feature["name"],
+                    feature["description"]
                 )
                 if description:
                     profile_text += f"\n  {description}"
+        else:
+            profile_text += "\nНет способностей и особенностей."
 
         if spells:
             profile_text += "\n\n<b>🔮 Заклинания:</b>"
