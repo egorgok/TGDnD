@@ -52,6 +52,7 @@ database.yml
 # Logs
 logs/
 *.log
+secret
 
 # Cache
 .cache/

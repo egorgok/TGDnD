@@ -16,7 +16,8 @@ from src.services import (
 )
 from src.services.open5e_rules_service import (
     build_dm_rules_context, build_creature_catalog, build_item_catalog,
-    localize_catalog_item, is_open5e_catalog_item
+    localize_catalog_item, is_open5e_catalog_item,
+    repair_srd2024_feature_descriptions
 )
 from src.services.open5e_localization import canonical_item_name, localized_item_type
 from src.services.character_service import add_experience, XP_THRESHOLDS
@@ -1292,6 +1293,7 @@ async def inspect_entity_command(message: types.Message):
                 None
             )
             if companion:
+                repair_srd2024_feature_descriptions(db, companion)
                 attributes = db.query(CharacterAttribute).filter(
                     CharacterAttribute.character_id == companion.id
                 ).first()

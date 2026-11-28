@@ -171,6 +171,46 @@ def grant_starting_species_data(db: Session, character) -> int:
     return added
 
 
+def repair_srd2024_feature_descriptions(db: Session, character) -> int:
+    """Replace old generic placeholder text with the matching 2024 SRD description."""
+    class_record = _class_record(db, character.class_)
+    if not class_record:
+        return 0
+
+    def normalize(value: str) -> str:
+        return re.sub(r"[^a-zа-яё0-9]+", " ", value.casefold().replace("ё", "е")).strip()
+
+    feature_descriptions = {}
+    for feature in class_record.get("features", []):
+        if not isinstance(feature, dict) or feature.get("feature_type") == "STARTING_EQUIPMENT":
+            continue
+        description = str(feature.get("desc") or "").strip()
+        if not description:
+            continue
+        for label in (feature.get("name"), feature.get("canonical_name")):
+            if label:
+                feature_descriptions[normalize(str(label))] = description
+
+    repaired = 0
+    abilities = db.query(CharacterAbility).filter(
+        CharacterAbility.character_id == character.id,
+        CharacterAbility.is_class.is_(True)
+    ).all()
+    for ability in abilities:
+        current_description = str(ability.ability_description or "").strip()
+        if current_description and not current_description.startswith(
+            "Описание особенности взято из SRD"
+        ):
+            continue
+        description = feature_descriptions.get(normalize(ability.ability_name))
+        if description:
+            ability.ability_description = description[:5000]
+            repaired += 1
+    if repaired:
+        db.commit()
+    return repaired
+
+
 def grant_starting_background_data(db: Session, character, background_key: str) -> dict[str, int]:
     """Grant a 2024 background's origin feat, proficiencies, and starting gear."""
     background = _srd2024_record(db, "backgrounds", background_key)
@@ -636,7 +676,10 @@ def grant_starting_class_data(db: Session, character) -> dict[str, int]:
                 ability_name=display_name,
                 ability_description=localized_feature_description(
                     name,
-                    "Описание особенности взято из SRD D&D 5e 2024."
+                    str(
+                        feature.get("desc")
+                        or "Описание особенности взято из SRD D&D 5e 2024."
+                    )
                 ),
                 is_class=True
             ))

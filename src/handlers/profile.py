@@ -13,6 +13,7 @@ from src.services.open5e_localization import localized_feature_description
 from src.services.inventory_service import InventoryService
 from src.services.character_service import xp_for_next_level
 from src.services.campaign_context import resolve_group, resolve_character
+from src.services.open5e_rules_service import repair_srd2024_feature_descriptions
 from src.utils import format_error
 import logging
 
@@ -53,6 +54,8 @@ async def profile_command(message: types.Message):
                 reply_markup=keyboard
             )
             return
+
+        repair_srd2024_feature_descriptions(db, character)
 
         # Get character attributes
         attributes = db.query(CharacterAttribute).filter(
@@ -95,12 +98,12 @@ async def profile_command(message: types.Message):
 <b>💰 Кошелёк:</b> {purse.gold} зм · {purse.silver} см · {purse.copper} мм
 
 <b>📊 Характеристики:</b>
-<b>STR</b> {attributes.strength} ({(attributes.strength-10)//2:+d})
-<b>DEX</b> {attributes.dexterity} ({(attributes.dexterity-10)//2:+d})
-<b>CON</b> {attributes.constitution} ({(attributes.constitution-10)//2:+d})
-<b>INT</b> {attributes.intelligence} ({(attributes.intelligence-10)//2:+d})
-<b>WIS</b> {attributes.wisdom} ({(attributes.wisdom-10)//2:+d})
-<b>CHA</b> {attributes.charisma} ({(attributes.charisma-10)//2:+d})
+<b>СИЛ</b> {attributes.strength} ({(attributes.strength-10)//2:+d})
+<b>ЛОВ</b> {attributes.dexterity} ({(attributes.dexterity-10)//2:+d})
+<b>ТЕЛ</b> {attributes.constitution} ({(attributes.constitution-10)//2:+d})
+<b>ИНТ</b> {attributes.intelligence} ({(attributes.intelligence-10)//2:+d})
+<b>МУД</b> {attributes.wisdom} ({(attributes.wisdom-10)//2:+d})
+<b>ХАР</b> {attributes.charisma} ({(attributes.charisma-10)//2:+d})
 
 <b>🎒 Инвентарь:</b>
 """

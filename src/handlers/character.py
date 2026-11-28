@@ -324,6 +324,10 @@ async def choose_background_callback(query: types.CallbackQuery, state: FSMConte
         name = str(localized.get("name") or background.get("name") or background_key)
         allowed_scores = localized.get("ability_scores") or background.get("ability_scores") or []
         score_names = []
+        display_by_key = {
+            "str": "СИЛ", "dex": "ЛОВ", "con": "ТЕЛ",
+            "int": "ИНТ", "wis": "МУД", "cha": "ХАР",
+        }
         score_keys = []
         for score in allowed_scores:
             if not isinstance(score, dict):
@@ -332,7 +336,15 @@ async def choose_background_callback(query: types.CallbackQuery, state: FSMConte
             if key not in {"str", "dex", "con", "int", "wis", "cha"}:
                 continue
             score_keys.append(key)
-            score_names.append(str(score.get("name") or key.upper()))
+            score_names.append(display_by_key[key])
+        example_two = (
+            f"{display_by_key[score_keys[0]]}+2; {display_by_key[score_keys[1]]}+1"
+            if len(score_keys) >= 2 else "СИЛ+2; ЛОВ+1"
+        )
+        example_three = (
+            "; ".join(f"{display_by_key[key]}+1" for key in score_keys[:3])
+            if len(score_keys) >= 3 else "СИЛ+1; ЛОВ+1; ТЕЛ+1"
+        )
         await state.update_data(
             background_key=background_key,
             background=name,
@@ -340,9 +352,12 @@ async def choose_background_callback(query: types.CallbackQuery, state: FSMConte
         )
         await query.message.edit_text(
             f"<b>Предыстория:</b> {name}\n\n"
-            f"Доступные характеристики: {', '.join(score_names)}.\n"
-            "Выберите повышение характеристик из предыстории 2024: "
-            "например, <code>WIS+2, CHA+1</code> или три значения по +1."
+            "<b>Шаг 4: бонусы характеристик от предыстории</b>\n"
+            "Распределите бонусы одним из способов: <b>+2 и +1</b> "
+            "между двумя характеристиками или <b>+1 +1 +1</b> "
+            "между тремя разными.\n"
+            f"Доступные характеристики: <b>{', '.join(score_names)}</b>.\n"
+            f"Примеры: <code>{example_two}</code> / <code>{example_three}</code>"
         )
         await query.answer()
         await state.set_state(CharacterCreationStates.choosing_background_abilities)
@@ -372,7 +387,8 @@ async def choose_background_abilities_message(message: types.Message, state: FSM
         if not score or score not in allowed or score in bonuses:
             await message.answer(
                 "❌ Выберите характеристики только из списка предыстории, "
-                "без повторов. Пример: <code>WIS+2, CHA+1</code>."
+                "без повторов. Пишите русские обозначения, например "
+                "<code>МУД+2; ИНТ+1</code>."
             )
             return
         bonuses[score] = int(amount)
@@ -383,7 +399,8 @@ async def choose_background_abilities_message(message: types.Message, state: FSM
     if not valid:
         await message.answer(
             "❌ Нужно распределить ровно +3: два значения +2 и +1 "
-            "или три разных значения по +1."
+            "или три разных значения по +1. Например: "
+            "<code>ЛОВ+2; ТЕЛ+1</code> или <code>ЛОВ+1; ТЕЛ+1; ИНТ+1</code>."
         )
         return
     await state.update_data(background_bonuses=bonuses)
@@ -394,9 +411,12 @@ async def choose_background_abilities_message(message: types.Message, state: FSM
         f"🧙 <b>Создание персонажа</b>\n\n"
         f"<b>Вид:</b> {race}\n<b>Класс:</b> {class_name}\n"
         f"<b>Предыстория:</b> {data.get('background')}\n<b>Имя:</b> {name}\n\n"
-        "Шаг 5: распределите готовый набор чисел "
+        "<b>Шаг 5: распределение характеристик</b>\n"
+        "Распределите готовый набор чисел "
         "<b>15, 14, 13, 12, 10, 8</b>.\n"
-        "Введите 6 чисел через запятую в порядке STR, DEX, CON, INT, WIS, CHA."
+        "Введите 6 чисел через запятую в порядке "
+        "<b>СИЛ, ЛОВ, ТЕЛ, ИНТ, МУД, ХАР</b>.\n"
+        "Пример: <code>15, 14, 13, 12, 10, 8</code>."
     )
     await state.set_state(CharacterCreationStates.distributing_attributes)
 
@@ -484,7 +504,11 @@ CHA: {final_attributes['cha']} ({(final_attributes['cha']-10)//2:+d})
         await state.set_state(CharacterCreationStates.confirming)
 
     except ValueError:
-        await message.answer("❌ Введите 6 чисел через запятую\nПример: 15, 14, 13, 12, 10, 8")
+        await message.answer(
+            "❌ Введите 6 чисел через запятую в порядке "
+            "СИЛ, ЛОВ, ТЕЛ, ИНТ, МУД, ХАР.\n"
+            "Пример: <code>15, 14, 13, 12, 10, 8</code>."
+        )
 
 
 @router.callback_query(CharacterCreationStates.confirming, F.data == "confirm_create")
